@@ -14,7 +14,7 @@ from app.api.ingestion_router import router as ingestion_router
 from app.auth_utils import get_current_user
 from app.config import settings
 from app.database import MongoDB, get_db
-from app.models import SearchRequest
+from app.models import ScrapeRequest, SearchRequest
 from app.schemas import ChatMessageCreateRequest, ChatThreadCreateRequest, UserSettingsUpdateRequest
 from app.services.chat_service import ChatService
 from app.services.dashboard_service import DashboardService
@@ -22,8 +22,11 @@ from app.services.enrichment_service import EnrichmentService
 from app.services.insight_service import InsightService
 from app.services.llm_service import LLMService
 from app.services.normalization_service import normalize_mention, utcnow
+from app.services.nps_service import NpsService
 from app.services.report_service import ReportService
+from app.services.scraper_service import ScraperService
 from app.services.search_service import SearchService
+from app.services.source_registry_service import SourceRegistryService
 
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -38,6 +41,21 @@ class AnalyzeRequest(BaseModel):
 class InsightGenerateRequest(BaseModel):
     batch_id: str | None = None
     force: bool = False
+
+
+class NpsSubmitRequest(BaseModel):
+    session_id: str
+    module_key: str = "geral"
+    score: int
+    comment: str | None = None
+    route: str | None = None
+    context_metadata: dict | None = None
+
+
+class NpsDismissRequest(BaseModel):
+    session_id: str
+    module_key: str = "geral"
+    route: str | None = None
 
 
 async def auto_refresh_loop() -> None:
@@ -55,7 +73,7 @@ async def auto_refresh_loop() -> None:
                     await SearchService.run_search(
                         user_id=job["user_id"],
                         query=job["query"],
-                        sources=job.get("sources", ["google", "reddit", "x"]),
+                        sources=job.get("sources", SourceRegistryService.default_sources()),
                         period_days=job.get("period_days", 30),
                         locality=job.get("locality"),
                         use_cache=False,
@@ -69,6 +87,12 @@ async def auto_refresh_loop() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await MongoDB.connect_db()
+    SourceRegistryService.sync_defaults_to_db()
+
+    try:
+        await LLMService.validate_connection()
+    except Exception as exc:
+        logger.warning(f"Ollama não acessível. Funcionalidades de IA desabilitadas: {exc}")
 
     task = None
     if settings.AUTO_REFRESH_ENABLED:
@@ -84,7 +108,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SentimentoIA API",
-    description="Backend sem Apify: Google Places, Reddit, X/snscrape, OpenRouter/Ollama, MongoDB, CSV/PDF.",
+    description="Backend com scraping (Reclame Aqui, Reddit, Mastodon e Web aberto), Ollama Cloud e MongoDB.",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -132,13 +156,17 @@ async def health():
 async def integrations_status():
     """Mostra se as integrações principais estão configuradas."""
     llm = await LLMService.healthcheck()
+    active_sources = SourceRegistryService.active_sources()
     return {
-        "google_places_configured": bool(settings.GOOGLE_PLACES_API_KEY and settings.GOOGLE_PLACES_API_KEY != "SUA_CHAVE_GOOGLE_PLACES"),
-        "reddit_public_enabled": True,
-        "x_snscrape_enabled": settings.X_SNSCRAPE_ENABLED,
+        "scraping_enabled": True,
+        "scraper_delay_seconds": settings.SCRAPER_DELAY_SECONDS,
+        "scraper_default_limit": settings.SCRAPER_DEFAULT_LIMIT,
+        "scraper_default_sources": SourceRegistryService.default_sources(),
+        "scraper_active_sources": active_sources,
+        "scraper_source_metadata": SourceRegistryService.source_metadata(),
         "mongodb_configured": bool(settings.MONGODB_URI),
         "llm": llm,
-        "apify_removed": True,
+        "external_source_apis_removed": True,
     }
 
 
@@ -149,7 +177,7 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
     Entrada esperada:
     {
       "brand_name": "Nike",
-      "sources": ["google", "reddit", "x"],
+            "sources": ["reclameaqui", "reddit", "mastodon"],
       "period_days": 30,
       "locality": "São Paulo",
       "replace_existing": false
@@ -171,6 +199,20 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
         use_cache=not payload.replace_existing,
     )
     return result
+
+
+@app.post("/api/scrape")
+async def scrape_mentions(payload: ScrapeRequest, current_user: dict[str, Any] = Depends(get_current_user)):
+    """Executa scraping simples por fonte e retorna resultados agrupados."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    sources = [getattr(source, "value", str(source)) for source in payload.sources]
+    return await asyncio.to_thread(
+        ScraperService.scrape,
+        query=payload.query,
+        sources=sources,
+        limit_per_source=payload.limit_per_source,
+        user_id=user_id,
+    )
 
 
 @app.get("/api/dashboard")
@@ -501,9 +543,140 @@ async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
         "chat_messages",
         "chat_threads",
         "comment_batches",
+        "nps_responses",
     ]
     for collection_name in collections:
         collection = getattr(db, collection_name)
         collection.delete_many({"user_id": user_id})
     db.dashboard_settings.delete_many({"user_id": user_id})
     return {"ok": True, "message": "Dados do usuário removidos"}
+
+# ==================== DATA MANAGEMENT (DELETE) ====================
+
+@app.delete("/api/conversations/{id}")
+async def delete_conversation(id: str, current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    result = db.chat_threads.delete_one({"_id": id, "user_id": user_id})
+    if result.deleted_count == 0:
+        result = db.chat_threads.delete_one({"thread_id": id, "user_id": user_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+    db.chat_messages.delete_many({"thread_id": id, "user_id": user_id})
+    return {"ok": True}
+
+@app.delete("/api/conversations/{id}/messages/{msg_id}")
+async def delete_message(id: str, msg_id: str, current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    result = db.chat_messages.delete_one({"_id": msg_id, "thread_id": id, "user_id": user_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Mensagem não encontrada")
+    return {"ok": True}
+
+@app.delete("/api/conversations/all")
+async def delete_all_conversations(current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    db.chat_threads.delete_many({"user_id": user_id})
+    db.chat_messages.delete_many({"user_id": user_id})
+    return {"ok": True}
+
+@app.delete("/api/searches/{id}")
+async def delete_search(id: str, current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    result = db.search_jobs.delete_one({"search_id": id, "user_id": user_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Pesquisa não encontrada")
+    db.mentions.delete_many({"search_id": id, "user_id": user_id})
+    return {"ok": True}
+
+@app.delete("/api/searches/all")
+async def delete_all_searches(current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    db.search_jobs.delete_many({"user_id": user_id})
+    db.mentions.delete_many({"user_id": user_id})
+    return {"ok": True}
+
+@app.delete("/api/insights/all")
+async def delete_all_insights(current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    db.insights.delete_many({"user_id": user_id})
+    return {"ok": True}
+
+@app.delete("/api/user/data/all")
+async def delete_all_user_data(current_user: dict[str, Any] = Depends(get_current_user)):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    db = get_db()
+    collections = [
+        "mentions", "search_jobs", "alerts", "reports", "insight_jobs", 
+        "insights", "chat_messages", "chat_threads", "comment_batches", 
+        "nps_responses", "scraped_items", "scrape_cache"
+    ]
+    for coll in collections:
+        db[coll].delete_many({"user_id": user_id})
+    db.dashboard_settings.delete_many({"user_id": user_id})
+    return {"ok": True, "message": "Todos os dados do usuário foram apagados com sucesso"}
+
+
+# ==================== NPS ====================
+
+@app.post("/api/nps/submit")
+async def nps_submit(
+    payload: NpsSubmitRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Registra resposta NPS do usuario."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        result = NpsService.submit_response(
+            user_id=user_id,
+            session_id=payload.session_id,
+            module_key=payload.module_key,
+            score=payload.score,
+            comment=payload.comment,
+            route=payload.route,
+            context_metadata=payload.context_metadata,
+        )
+        return {"ok": True, "item": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/nps/dismiss")
+async def nps_dismiss(
+    payload: NpsDismissRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Registra que o usuario adiou/fechou o NPS."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    result = NpsService.submit_dismiss(
+        user_id=user_id,
+        session_id=payload.session_id,
+        module_key=payload.module_key,
+        route=payload.route,
+    )
+    return {"ok": True, "item": result}
+
+
+@app.get("/api/nps/check")
+async def nps_check(
+    session_id: str = Query(...),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Verifica se deve mostrar NPS ao usuario."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    return {"should_show": NpsService.should_show_nps(user_id=user_id, session_id=session_id)}
+
+
+@app.get("/api/nps/metrics")
+async def nps_metrics(
+    period_days: int | None = Query(None, ge=1, le=365),
+    module_key: str | None = Query(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Retorna metricas NPS agregadas."""
+    return NpsService.get_metrics(period_days=period_days, module_key=module_key)

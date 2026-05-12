@@ -83,6 +83,17 @@ class MongoDB:
             cls.db.mentions.create_index([("user_id", 1), ("batch_id", 1), ("status", 1), ("created_at", -1)])
             cls.db.mentions.create_index([("user_id", 1), ("external_id", 1), ("batch_id", 1)])
             cls.db.mentions.create_index([("user_id", 1), ("text_fingerprint", 1), ("batch_id", 1)])
+            cls.db.mentions.create_index([("user_id", 1), ("content_hash", 1)])
+            cls.db.mentions.create_index([("user_id", 1), ("canonical_url", 1)])
+            cls.db.mentions.create_index([("user_id", 1), ("source", 1), ("published_at", -1)])
+
+            cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("created_at", -1)])
+            cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("canonical_url", 1)])
+            cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("content_hash", 1)])
+
+            cls.db.source_checkpoints.create_index([("source", 1), ("query_key", 1)], unique=True)
+            cls.db.monitor_sources.create_index("name", unique=True)
+            cls.db.monitor_sources.create_index([("active", 1), ("priority", -1)])
 
             cls.db.comment_batches.create_index([("user_id", 1), ("created_at", -1)])
             cls.db.comment_batches.create_index("batch_id", unique=True)
@@ -96,6 +107,10 @@ class MongoDB:
             cls.db.alerts.create_index([("user_id", 1), ("search_id", 1), ("created_at", -1)])
             cls.db.reports.create_index([("user_id", 1), ("search_id", 1), ("created_at", -1)])
             cls.db.audit_logs.create_index([("user_id", 1), ("created_at", -1)])
+
+            cls.db.nps_responses.create_index([("user_id", 1), ("created_at", -1)])
+            cls.db.nps_responses.create_index([("session_id", 1), ("created_at", -1)])
+            cls.db.nps_responses.create_index([("module_key", 1), ("created_at", -1)])
 
             logger.info("✓ Índices criados com sucesso")
 

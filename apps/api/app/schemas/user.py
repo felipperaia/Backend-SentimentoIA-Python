@@ -10,6 +10,7 @@ class UserRole(str, Enum):
 class UserBase(BaseModel):
     email: EmailStr
     name: str
+    username: Optional[str] = None
     phone: Optional[str] = None
 
 class UserCreate(UserBase):
@@ -18,6 +19,7 @@ class UserCreate(UserBase):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    mfa_code: Optional[str] = Field(default=None, min_length=6, max_length=6)
 
 class UserResponse(UserBase):
     id: Optional[str] = None
@@ -37,14 +39,44 @@ class MFASetup(BaseModel):
     qr_code: str
 
 class MFAVerify(BaseModel):
-    code: str
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+class MFAStatusResponse(BaseModel):
+    mfa_enabled: bool
+    mfa_verified: bool
+
+
+class MFADisable(BaseModel):
+    password: str = Field(..., min_length=8)
+
+
+class MFALoginChallenge(BaseModel):
+    mfa_required: bool = True
+    message: str
 
 class PasswordReset(BaseModel):
     email: EmailStr
 
+
 class PasswordResetConfirm(BaseModel):
     token: str
     new_password: str = Field(..., min_length=8)
+
+
+class PasswordResetResponse(BaseModel):
+    status: str
+    message: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=8)
+    new_password: str = Field(..., min_length=8)
+
+
+class UserProfileUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=120)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=32)
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None

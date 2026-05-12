@@ -24,12 +24,21 @@ class AspectType(str, Enum):
     EXPERIENCE = "experience"
 
 class MentionSource(str, Enum):
+    RECLAMEAQUI = "reclameaqui"
+    REDDIT = "reddit"
+    MASTODON = "mastodon"
+    WEB = "web"
+
+    # Legado/compatibilidade
     GOOGLE = "google"
+    X = "x"
+    TWITTER = "twitter"
+
+    # Canais opcionais
     TRUSTPILOT = "trustpilot"
     YELP = "yelp"
     TRIPADVISOR = "tripadvisor"
     INSTAGRAM = "instagram"
-    TWITTER = "twitter"
     FACEBOOK = "facebook"
 
 class MentionBase(BaseModel):

@@ -1,6 +1,5 @@
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -9,8 +8,8 @@ class Settings(BaseSettings):
     Manutenção:
     - Nunca coloque chaves reais aqui.
         - Use sempre o arquivo apps/api/.env.
-    - O Apify foi removido do fluxo principal. As fontes reais agora são:
-      Google Places API, Reddit público e X via snscrape.
+        - O Apify foi removido do fluxo principal.
+        - Coleta de fontes externas agora usa scraping com BeautifulSoup.
     """
 
     ENV: str = "development"
@@ -27,17 +26,40 @@ class Settings(BaseSettings):
     MONGODB_URI: str = "mongodb://localhost:27017"
     DATABASE_NAME: str = "sentimento_db"
 
-    # LLM oficial do MVP: Ollama (local/cloud).
+    # LLM oficial do MVP: Ollama Cloud.
     LLM_PROVIDER: str = "ollama"
-    OLLAMA_MODE: str = "local"  # local | cloud
-    OLLAMA_LOCAL_URL: str = "http://localhost:11434"
+    OLLAMA_BASE_URL: str = "https://ollama.com/api"
+    # Legado: mantido para compatibilidade com ambientes antigos.
     OLLAMA_CLOUD_URL: str = ""
     OLLAMA_API_KEY: str = ""
     OLLAMA_MODEL: str = "llama3.1:8b"
+    OLLAMA_TIMEOUT_SECONDS: int = 60
 
-    # Compatibilidade com variáveis antigas do projeto.
-    OLLAMA_ENABLED: bool = True
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    # URL publica do frontend para links transacionais.
+    FRONTEND_URL: str = "http://localhost:5173"
+
+    # Recuperacao de senha.
+    PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # SMTP (provedor gratuito suportado via credenciais do usuario).
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""
+    SMTP_FROM_EMAIL: str = "no-reply@sentimentoia.local"
+    SMTP_FROM_NAME: str = "SentimentoIA"
+    SMTP_USE_TLS: bool = True
+    SMTP_USE_SSL: bool = False
+
+    @property
+    def SMTP_EFFECTIVE_USERNAME(self) -> str:
+        return (self.SMTP_USER or self.SMTP_USERNAME or "").strip()
+
+    @property
+    def SMTP_EFFECTIVE_FROM_EMAIL(self) -> str:
+        return (self.SMTP_FROM or self.SMTP_FROM_EMAIL or "").strip()
 
     # Legado: mantido apenas para não quebrar ambientes antigos.
     OPENROUTER_API_KEY: str = ""
@@ -61,21 +83,47 @@ class Settings(BaseSettings):
 
     @property
     def OLLAMA_EFFECTIVE_MODE(self) -> str:
-        mode = (self.OLLAMA_MODE or "local").strip().lower()
-        return "cloud" if mode == "cloud" else "local"
+        return "cloud"
 
     @property
     def OLLAMA_EFFECTIVE_URL(self) -> str:
-        if self.OLLAMA_EFFECTIVE_MODE == "cloud":
-            return (self.OLLAMA_CLOUD_URL or "").strip()
-        # Para modo local, prioriza OLLAMA_LOCAL_URL e mantém fallback legado.
-        return (self.OLLAMA_LOCAL_URL or self.OLLAMA_BASE_URL or "").strip()
+        """Retorna base URL normalizada, sem trailing /api para evitar duplicacao.
 
-    # Coleta real sem Apify
-    GOOGLE_PLACES_API_KEY: Optional[str] = None
-    REDDIT_USER_AGENT: str = "webapp-sentimento/1.0"
-    X_SNSCRAPE_ENABLED: bool = False
-    X_MAX_RESULTS: int = 20
+        Se o usuario configurar OLLAMA_BASE_URL=https://ollama.com/api,
+        esta property retorna https://ollama.com para que o servico monte
+        /api/generate corretamente.
+        """
+        configured_url = (self.OLLAMA_BASE_URL or self.OLLAMA_CLOUD_URL or "").strip().rstrip("/")
+        normalized = configured_url.lower()
+        if "localhost" in normalized or "127.0.0.1" in normalized:
+            return ""
+        # Remove trailing /api para evitar /api/api/generate
+        if normalized.endswith("/api"):
+            configured_url = configured_url[:-4]
+        return configured_url
+
+    # Scraping (POC/MVP)
+    SCRAPER_USER_AGENT: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    SCRAPER_DELAY_SECONDS: float = 1.0
+    SCRAPER_TIMEOUT_SECONDS: int = 20
+    SCRAPER_DEFAULT_LIMIT: int = 5
+    SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,mastodon"
+    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 10
+    SCRAPER_MAX_TOTAL_ITEMS: int = 50
+    SCRAPER_MAX_PAGES_PER_SOURCE: int = 2
+    SCRAPER_RETRY_ATTEMPTS: int = 3
+    SCRAPER_RETRY_BACKOFF_SECONDS: float = 1.0
+    SCRAPER_MIN_TEXT_LENGTH: int = 20
+    SCRAPER_RECLAMEAQUI_URL: str = "https://www.reclameaqui.com.br"
+    SCRAPER_RECLAMEAQUI_SEARCH_URL: str = "https://www.reclameaqui.com.br/busca/?q="
+    SCRAPER_REDDIT_URL: str = "https://www.reddit.com"
+    SCRAPER_MASTODON_BASE_URL: str = "https://mastodon.social"
+    SCRAPER_MASTODON_SEARCH_PATH: str = "/api/v2/search"
+    SCRAPER_MASTODON_ACCESS_TOKEN: str = ""
+    SCRAPER_WEB_SEARCH_URL: str = "https://duckduckgo.com/html/"
 
     # Cache e atualização automática
     CACHE_TTL_MINUTES: int = 30
@@ -108,6 +156,11 @@ class Settings(BaseSettings):
     LLM_TRIGGER_MIN_COMMENTS: int = 20
     LLM_MAX_SAMPLE_MENTIONS: int = 40
     LOG_LEVEL: str = "INFO"
+
+    # NPS
+    NPS_COOLDOWN_DAYS: int = 7
+    NPS_MIN_INTERACTIONS: int = 5
+    NPS_ENABLED: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

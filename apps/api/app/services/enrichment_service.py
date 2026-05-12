@@ -41,7 +41,7 @@ class EnrichmentService:
         pos = sum(1 for w in POSITIVE_TERMS if w in lower)
         neg = sum(1 for w in NEGATIVE_TERMS if w in lower)
 
-        # Rating do Google ajuda a calibrar sentimento.
+        # Rating explicito ajuda a calibrar sentimento quando a fonte fornecer nota.
         if rating is not None:
             try:
                 r = float(rating)

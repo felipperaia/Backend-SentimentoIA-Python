@@ -24,16 +24,27 @@ No PowerShell (Windows):
 
 ```powershell
 cd repos-separados-20260506/backend-api-python/apps/api
-python -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install --upgrade pip
-pip install -r requirements.txt
-# copiar .env exemplo
-Copy-Item .env.example .env
-# Ajustar .env: MONGODB_URI, SECRET_KEY, FRONTEND_URL, OLLAMA_* etc.
-# Rodar API (desenvolvimento):
-uvicorn app.main:app --reload --port 8000 --app-dir .
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env -ErrorAction SilentlyContinue
+python -m uvicorn app.main:app --reload --port 8000 --app-dir .
 ```
+
+No Prompt de Comando (cmd):
+
+```bat
+cd repos-separados-20260506\backend-api-python\apps\api
+py -3.11 -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+copy .env.example .env
+python -m uvicorn app.main:app --reload --port 8000 --app-dir .
+```
+
+Observacao: em `cmd.exe`, comandos como `Copy-Item` e linhas iniciadas com `#` nao funcionam.
 
 Em bash/macOS:
 
@@ -71,8 +82,17 @@ Variáveis de ambiente críticas (copiar de `apps/api/.env.example`)
 - `DATABASE_NAME` — nome do DB (ex.: `sentimento_db`)
 - `SECRET_KEY` — chave JWT
 - `FRONTEND_URL` — URL do frontend (CORS)
-- `LLM_PROVIDER`, `OLLAMA_MODE`, `OLLAMA_LOCAL_URL`, `OLLAMA_CLOUD_URL`, `OLLAMA_API_KEY`, `OLLAMA_MODEL`
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`/`SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`/`SMTP_FROM_EMAIL`
+- `LLM_PROVIDER`, `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `OLLAMA_MODEL`
+- `SCRAPER_DELAY_SECONDS`, `SCRAPER_TIMEOUT_SECONDS`, `SCRAPER_DEFAULT_LIMIT`, `SCRAPER_DEFAULT_SOURCES`
+- `SCRAPER_RECLAMEAQUI_SEARCH_URL`, `SCRAPER_REDDIT_URL`, `SCRAPER_MASTODON_BASE_URL`, `SCRAPER_WEB_SEARCH_URL`
 - `ENABLE_CHAT`, `ENABLE_INGESTION_API`, `ENABLE_EXPORTS` (flags)
+
+Endpoint de scraping para POC
+
+- `POST /api/scrape`
+- Payload: `{ "query": "marca", "sources": ["reclameaqui", "reddit", "mastodon"], "limit_per_source": 5 }`
+- Retorno: itens agrupados por fonte com retry/backoff, deduplicação incremental e persistência de checkpoints por fonte.
 
 Observações sobre `packages/prompts` e `worker`
 

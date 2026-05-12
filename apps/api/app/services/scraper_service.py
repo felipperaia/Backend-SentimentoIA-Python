@@ -1,0 +1,834 @@
+import logging
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from typing import Any
+import hashlib
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+
+from app.config import settings
+from app.database import get_db
+from app.services.normalization_service import canonicalize_url, compute_content_hash, utcnow
+from app.services.source_registry_service import SourceRegistryService
+
+logger = logging.getLogger(__name__)
+
+
+class ScraperService:
+    """Scraping com foco em fontes abertas e dedupe incremental persistido."""
+
+    LOW_SIGNAL_TERMS = {
+        "javascript",
+        "enable javascript",
+        "accept cookies",
+        "cookie policy",
+        "sign in",
+        "cadastre-se",
+        "faca login",
+        "clique aqui",
+        "ver mais",
+        "read more",
+    }
+
+    @staticmethod
+    def scrape(query: str, sources: list[str], limit_per_source: int | None = None, user_id: str = "") -> dict[str, Any]:
+        from app.services.insight_service import InsightService
+        user_settings = InsightService.get_user_settings(user_id=user_id) if user_id else {}
+        relevance_threshold = float(user_settings.get('scraper_relevance_threshold', getattr(settings, 'SCRAPER_RELEVANCE_THRESHOLD', 0.5)))
+        term = (query or "").strip()
+        if not term:
+            raise ValueError("Termo de busca obrigatorio")
+
+        normalized_sources, source_errors = SourceRegistryService.normalize_sources(sources)
+        max_per_source = max(1, int(settings.SCRAPER_MAX_ITEMS_PER_SOURCE))
+        limit = max(1, min(max_per_source, int(limit_per_source or settings.SCRAPER_DEFAULT_LIMIT)))
+        max_total = max(limit, int(settings.SCRAPER_MAX_TOTAL_ITEMS))
+
+        results: dict[str, list[dict[str, Any]]] = {source: [] for source in normalized_sources}
+        errors: list[dict[str, str]] = list(source_errors)
+
+        handlers = {
+            "reclameaqui": ScraperService._scrape_reclameaqui,
+            "reddit": ScraperService._scrape_reddit,
+            "mastodon": ScraperService._scrape_mastodon,
+            "web": ScraperService._scrape_web,
+        }
+
+        worker_count = min(max(1, len(normalized_sources)), 4)
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            future_map = {
+                pool.submit(ScraperService._run_source_pipeline, source, term, limit, handlers, user_id, relevance_threshold): source
+                for source in normalized_sources
+            }
+            for future in as_completed(future_map):
+                source = future_map[future]
+                try:
+                    source_items, source_error = future.result()
+                    results[source] = source_items
+                    if source_error:
+                        errors.append({"source": source, "error": source_error})
+                except Exception as exc:
+                    logger.exception("Erro durante scraping da fonte %s", source)
+                    results[source] = []
+                    errors.append({"source": source, "error": str(exc)})
+
+        total = sum(len(items) for items in results.values())
+        if total > max_total:
+            results = ScraperService._truncate_total_results(results, max_total)
+            total = sum(len(items) for items in results.values())
+
+        metadata = {
+            "sources": SourceRegistryService.source_metadata(),
+            "max_total_items": max_total,
+            "incremental_mode": True,
+        }
+
+        return {
+            "query": term,
+            "sources": normalized_sources,
+            "limit_per_source": limit,
+            "total": total,
+            "results": results,
+            "errors": errors,
+            "metadata": metadata,
+        }
+
+    @staticmethod
+    def _run_source_pipeline(
+        source: str,
+        query: str,
+        limit: int,
+        handlers: dict[str, Any],
+        user_id: str,
+        relevance_threshold: float
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        handler = handlers.get(source)
+        if handler is None:
+            return [], "Fonte sem handler de scraping"
+
+        raw_items, source_error = handler(query, limit)
+        if relevance_threshold > 0:
+            raw_items = [i for i in raw_items if ScraperService._relevance_check(query, i.get('title',''), i.get('snippet','')) >= relevance_threshold]
+        normalized = ScraperService._normalize_items(source, query, raw_items)
+        filtered = ScraperService._dedupe_and_persist(source, query, normalized, limit)
+        return filtered, source_error if source_error and not filtered else None
+
+    @staticmethod
+    def _truncate_total_results(
+        results: dict[str, list[dict[str, Any]]],
+        max_total: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if max_total <= 0:
+            return {source: [] for source in results}
+
+        ordered_sources = sorted(
+            results.keys(),
+            key=SourceRegistryService.source_priority,
+            reverse=True,
+        )
+
+        trimmed: dict[str, list[dict[str, Any]]] = {source: [] for source in results}
+        remaining = max_total
+        for source in ordered_sources:
+            if remaining <= 0:
+                break
+            source_items = results.get(source) or []
+            take = min(len(source_items), remaining)
+            trimmed[source] = source_items[:take]
+            remaining -= take
+
+        return trimmed
+
+    @staticmethod
+    def _build_reddit_queries(query: str) -> list[str]:
+        """Gera variações de consulta para melhorar relevância no Reddit."""
+        q = query.strip()
+        queries = [f'"{q}"']
+        if len(q.split()) <= 3:
+            queries.append(f'"{q}" brasil')
+            queries.append(f'"{q}" reclamação OR problema OR experiência')
+        return queries
+
+    @staticmethod
+    def _relevance_check(query: str, title: str, snippet: str) -> float:
+        q_lower = query.strip().lower()
+        combined = f"{title} {snippet}".lower()
+        if q_lower in combined:
+            return 1.0
+        words = q_lower.split()
+        matched = sum(1 for w in words if w in combined)
+        return matched / max(len(words), 1)
+
+    @staticmethod
+    def _reddit_relevance(query: str, title: str, snippet: str) -> float:
+        """Score de relevância: 0-1. Itens abaixo de 0.2 serão descartados."""
+        q_lower = query.strip().lower()
+        combined = f"{title} {snippet}".lower()
+        if q_lower in combined:
+            return 1.0
+        words = q_lower.split()
+        matched = sum(1 for w in words if w in combined)
+        return matched / max(len(words), 1)
+
+    @staticmethod
+    def _scrape_reddit(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
+        request_limit = max(limit * 4, limit)
+        subreddits = ["brasil", "brdev", "consumidor", "explainlikeimfive", "all"]
+        all_items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        for sub in subreddits:
+            endpoint = f"{settings.SCRAPER_REDDIT_URL.rstrip('/')}/r/{sub}/search.json"
+            try:
+                response = ScraperService._request(
+                    url=endpoint,
+                    params={"q": query, "sort": "relevance", "t": "year", "limit": request_limit, "raw_json": 1, "restrict_sr": "on" if sub != "all" else "off"},
+                    expect_json=True,
+                )
+                children = (response.json().get("data") or {}).get("children") or []
+                for child in children:
+                    data = child.get("data") or {}
+                    post_id = str(data.get("id") or "")
+                    if post_id in seen_ids:
+                        continue
+
+                    title = ScraperService._clean_text(str(data.get("title") or ""))
+                    snippet = ScraperService._clean_text(str(data.get("selftext") or ""))
+                    if not title and not snippet:
+                        continue
+
+                    permalink = str(data.get("permalink") or "").strip()
+                    item_url = urljoin("https://www.reddit.com", permalink) if permalink else str(data.get("url") or "")
+
+                    published_at = None
+                    created_utc = data.get("created_utc")
+                    if isinstance(created_utc, (int, float)):
+                        published_at = datetime.fromtimestamp(float(created_utc), tz=timezone.utc).isoformat()
+
+                    seen_ids.add(post_id)
+                    all_items.append({
+                        "id": post_id,
+                        "title": title,
+                        "snippet": snippet,
+                        "url": item_url,
+                        "author": ScraperService._clean_text(str(data.get("author") or "")) or None,
+                        "published_at": published_at,
+                        "raw": {
+                            "subreddit": data.get("subreddit"),
+                            "score": data.get("score"),
+                            "num_comments": data.get("num_comments"),
+                        },
+                    })
+                    if len(all_items) >= limit:
+                        break
+            except Exception:
+                continue
+            if len(all_items) >= limit:
+                break
+
+        if not all_items:
+            return [], "Reddit sem resultados relevantes"
+        return all_items, None
+
+    @staticmethod
+    def _scrape_reclameaqui(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
+        import unicodedata
+        import time
+        import random
+        
+        # 1. Converter query em slug
+        slug = unicodedata.normalize('NFKD', query).encode('ASCII', 'ignore').decode('utf-8')
+        slug = slug.lower().replace(' ', '-')
+        slug = re.sub(r'[^a-z0-9-]', '', slug)
+        
+        items: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        base_url = settings.SCRAPER_RECLAMEAQUI_URL.rstrip("/")
+        
+        # Headers mais realistas
+        extra_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
+        urls_to_try = [
+            f"{base_url}/empresa/{slug}/",
+            f"{settings.SCRAPER_RECLAMEAQUI_SEARCH_URL.strip()}{quote_plus(query)}"
+        ]
+        
+        for url in urls_to_try:
+            try:
+                time.sleep(random.uniform(2, 5))
+                response = ScraperService._request(url=url, params=None, extra_headers=extra_headers)
+                soup = BeautifulSoup(response.text, "html.parser")
+                
+                for link_node in soup.select("a[href]"):
+                    href = str(link_node.get("href") or "").strip()
+                    lower_href = href.lower()
+                    if "/reclamacao/" not in lower_href:
+                        continue
+
+                    item_url = canonicalize_url(urljoin(base_url, href))
+                    if not item_url or item_url in seen_urls:
+                        continue
+
+                    title = ScraperService._clean_text(link_node.get_text(" ", strip=True))
+                    if not title:
+                        continue
+
+                    container = link_node.find_parent(["article", "li", "div", "section", "a"])
+                    snippet = ""
+                    published_at = None
+
+                    if container is not None:
+                        for snippet_node in container.select("p, span"):
+                            text = ScraperService._clean_text(snippet_node.get_text(" ", strip=True))
+                            if text and text != title and len(text) >= int(settings.SCRAPER_MIN_TEXT_LENGTH):
+                                snippet = text
+                                break
+
+                    items.append({
+                        "id": item_url,
+                        "title": title,
+                        "snippet": snippet,
+                        "url": item_url,
+                        "author": None,
+                        "published_at": published_at,
+                        "raw": {},
+                    })
+                    seen_urls.add(item_url)
+                    
+                    if len(items) >= limit:
+                        break
+            except Exception as exc:
+                logger.warning(f"ReclameAqui tentativa {url} falhou: {exc}")
+                continue
+            
+            if items:
+                break
+                
+        if not items:
+            return [], "Reclame Aqui sem resultados"
+        return items, None
+
+    @staticmethod
+    def _scrape_mastodon(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
+        base_url = settings.SCRAPER_MASTODON_BASE_URL.rstrip("/")
+        path = settings.SCRAPER_MASTODON_SEARCH_PATH.strip() or "/api/v2/search"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        endpoint = f"{base_url}{path}"
+        access_token = (settings.SCRAPER_MASTODON_ACCESS_TOKEN or "").strip()
+
+        request_limit = max(limit * 4, limit)
+
+        # Monta params: sem 'resolve' e 'type' se nao houver token (modo publico)
+        params: dict[str, Any] = {"q": query, "limit": request_limit}
+        headers_extra: dict[str, str] = {}
+        if access_token:
+            params["type"] = "statuses"
+            params["resolve"] = "true"
+            headers_extra["Authorization"] = f"Bearer {access_token}"
+            logger.info("Mastodon: modo autenticado")
+        else:
+            logger.info("Mastodon: modo publico restrito (sem SCRAPER_MASTODON_ACCESS_TOKEN)")
+
+        try:
+            response = ScraperService._request(
+                url=endpoint,
+                params=params,
+                expect_json=True,
+                extra_headers=headers_extra,
+            )
+            resp_json = response.json()
+            statuses = resp_json.get("statuses") or []
+
+            # Fallback: se modo publico retornou hashtags/accounts em vez de statuses
+            if not statuses and not access_token:
+                logger.info("Mastodon modo publico: sem statuses retornados, degradacao elegante")
+                return [], "Mastodon: modo publico nao retornou statuses. Configure SCRAPER_MASTODON_ACCESS_TOKEN para melhores resultados."
+
+            items: list[dict[str, Any]] = []
+            for status in statuses:
+                content_html = str(status.get("content") or "")
+                content = ScraperService._clean_text(BeautifulSoup(content_html, "html.parser").get_text(" ", strip=True))
+                if not content or len(content) < 10:
+                    continue
+
+                title = content if len(content) <= 120 else f"{content[:117]}..."
+                account = status.get("account") or {}
+                author = ScraperService._clean_text(
+                    str(account.get("display_name") or account.get("username") or "")
+                )
+                item_url = str(status.get("url") or status.get("uri") or "").strip()
+
+                items.append({
+                    "id": str(status.get("id") or ""),
+                    "title": title,
+                    "snippet": content,
+                    "url": item_url,
+                    "author": author or None,
+                    "published_at": status.get("created_at"),
+                    "raw": {
+                        "replies_count": status.get("replies_count"),
+                        "reblogs_count": status.get("reblogs_count"),
+                        "favourites_count": status.get("favourites_count"),
+                    },
+                })
+
+            if not items:
+                return [], "Mastodon sem resultados"
+            return items, None
+        except Exception as exc:
+            error_msg = str(exc)
+            if "401" in error_msg:
+                logger.warning("Mastodon 401: token invalido ou endpoint requer autenticacao")
+                return [], "Mastodon: autenticacao falhou (401). Verifique SCRAPER_MASTODON_ACCESS_TOKEN."
+            logger.warning("Mastodon falha: %s", error_msg)
+            return [], f"Falha no Mastodon: {exc}"
+
+    @staticmethod
+    def _scrape_web(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
+        items: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        
+        try:
+            try:
+                from duckduckgo_search import DDGS
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(f'{query} avaliação OR reclamação OR opinião OR review', max_results=limit*2))
+                
+                for r in results:
+                    url = r.get("href")
+                    if url in seen_urls: continue
+                    seen_urls.add(url)
+                    items.append({
+                        "id": url,
+                        "title": r.get("title"),
+                        "snippet": r.get("body"),
+                        "url": url,
+                        "author": urlparse(url).netloc,
+                        "published_at": None,
+                        "raw": {},
+                    })
+            except Exception as e:
+                logger.warning(f"duckduckgo_search falhou, usando fallback. {e}")
+                # Fallback to duckduckgo html
+                response = ScraperService._request(url=settings.SCRAPER_WEB_SEARCH_URL.rstrip("/"), params={"q": f'"{query}"'})
+                soup = BeautifulSoup(response.text, "html.parser")
+                for container in soup.select("div.result, article, li"):
+                    link_node = container.select_one("a.result__a, h2 a, a[data-testid='result-title-a'], a[href]")
+                    if not link_node: continue
+                    target = ScraperService._extract_web_target(str(link_node.get("href") or "").strip())
+                    url = canonicalize_url(target)
+                    if not url or url in seen_urls: continue
+                    title = ScraperService._clean_text(link_node.get_text(" ", strip=True))
+                    seen_urls.add(url)
+                    items.append({
+                        "id": url, "title": title, "snippet": "", "url": url, "author": urlparse(url).netloc, "published_at": None, "raw": {}
+                    })
+
+            # Entrar nos top 5 links com trafilatura ou bs4
+            try:
+                import trafilatura
+            except ImportError:
+                trafilatura = None
+
+            for i, item in enumerate(items[:5]):
+                try:
+                    resp = requests.get(item["url"], timeout=10)
+                    if trafilatura:
+                        text = trafilatura.extract(resp.text)
+                        if text: item["snippet"] = text[:1000]
+                    else:
+                        s = BeautifulSoup(resp.text, "html.parser")
+                        item["snippet"] = s.get_text(" ", strip=True)[:1000]
+                except:
+                    pass
+
+            return items[:limit], None
+        except Exception as exc:
+            return [], f"Falha na busca Web: {exc}"
+
+    @staticmethod
+    def _scrape_trustpilot(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
+        url = f"https://www.trustpilot.com/search?query={quote_plus(query)}"
+        try:
+            response = ScraperService._request(url=url, params=None)
+            soup = BeautifulSoup(response.text, "html.parser")
+            items = []
+            for link in soup.select("a[name='business-unit-card']"):
+                href = link.get("href")
+                if not href: continue
+                item_url = urljoin("https://www.trustpilot.com", href)
+                title = ScraperService._clean_text(link.get_text(" ", strip=True))
+                items.append({
+                    "id": item_url,
+                    "title": title,
+                    "snippet": f"Trustpilot review para {query}",
+                    "url": item_url,
+                    "author": "Trustpilot",
+                    "published_at": None,
+                    "raw": {}
+                })
+                if len(items) >= limit: break
+            return items, None
+        except Exception as e:
+            return [], f"Falha Trustpilot: {e}"
+
+    @staticmethod
+    def _scrape_consumidor(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
+        url = f"https://www.consumidor.gov.br/pages/empresa/buscarPorNome.json"
+        try:
+            response = requests.post(url, data={"query": query}, timeout=10)
+            items = []
+            # Consumidor.gov returns JSON if search matched
+            try:
+                data = response.json()
+                for d in data:
+                    item_url = f"https://www.consumidor.gov.br/pages/empresa/{d.get('id')}"
+                    items.append({
+                        "id": item_url,
+                        "title": f"Consumidor.gov.br - {d.get('nomeFantasia', query)}",
+                        "snippet": f"Avaliações oficiais no portal do consumidor.",
+                        "url": item_url,
+                        "author": "Consumidor.gov.br",
+                        "published_at": None,
+                        "raw": d
+                    })
+                    if len(items) >= limit: break
+            except:
+                pass
+            return items, None
+        except Exception as e:
+            return [], f"Falha Consumidor.gov.br: {e}"
+
+
+    @staticmethod
+    def _extract_web_target(href: str) -> str:
+        if not href:
+            return ""
+
+        if href.startswith("/"):
+            parsed = urlparse(href)
+            params = parse_qs(parsed.query)
+            if "uddg" in params and params["uddg"]:
+                return unquote(params["uddg"][0])
+            return urljoin("https://duckduckgo.com", href)
+
+        return href
+
+    @staticmethod
+    def _normalize_items(source: str, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+
+        for item in items:
+            title = ScraperService._clean_text(str(item.get("title") or ""))
+            snippet = ScraperService._clean_text(str(item.get("snippet") or ""))
+            text = "\n".join(part for part in [title, snippet] if part).strip()
+            if not text:
+                continue
+
+            if ScraperService._looks_like_low_signal(text):
+                continue
+
+            if len(text) < max(8, int(settings.SCRAPER_MIN_TEXT_LENGTH // 2)):
+                continue
+
+            original_url = str(item.get("url") or "").strip()
+            canonical_url = canonicalize_url(str(item.get("canonical_url") or original_url))
+            if not original_url and not canonical_url:
+                continue
+
+            author = ScraperService._clean_text(str(item.get("author") or ""))
+            content_hash = compute_content_hash(
+                source=source,
+                author=author or "desconhecido",
+                text=text,
+                url=canonical_url or original_url,
+            )
+            dedupe_key = canonical_url or content_hash
+            if dedupe_key in seen_keys:
+                continue
+
+            quality_score = ScraperService._quality_score(text, title=title, snippet=snippet)
+            if quality_score < 0.25:
+                continue
+
+            seen_keys.add(dedupe_key)
+            normalized.append(
+                {
+                    "id": str(item.get("id") or item.get("source_item_id") or content_hash),
+                    "source": source,
+                    "entity": query,
+                    "title": title or text[:120],
+                    "snippet": snippet,
+                    "text": text,
+                    "url": canonical_url or original_url,
+                    "canonical_url": canonical_url or None,
+                    "author": author or None,
+                    "published_at": ScraperService._normalize_datetime(item.get("published_at")),
+                    "collected_at": utcnow().isoformat(),
+                    "content_hash": content_hash,
+                    "source_priority": SourceRegistryService.source_priority(source),
+                    "quality_score": round(quality_score, 3),
+                    "raw": item.get("raw") if isinstance(item.get("raw"), dict) else item,
+                }
+            )
+
+        normalized.sort(key=lambda entry: float(entry.get("quality_score") or 0), reverse=True)
+        return normalized
+
+    @staticmethod
+    def _dedupe_and_persist(
+        source: str,
+        query: str,
+        items: list[dict[str, Any]],
+        limit: int,
+        user_id: str = "",
+    ) -> list[dict[str, Any]]:
+        if not items:
+            ScraperService._update_source_checkpoint(source=source, query=query, item_count=0, user_id=user_id)
+            return []
+
+        db = get_db()
+        if db is None:
+            return items[:limit]
+
+        query_key = query.strip().lower()
+        candidate_urls = [str(item.get("canonical_url") or "") for item in items if item.get("canonical_url")]
+        candidate_hashes = [str(item.get("content_hash") or "") for item in items if item.get("content_hash")]
+
+        existing_hashes: set[str] = set()
+
+        if db is not None:
+            # Lógica anti-duplicata usando SHA256 no banco scrape_cache
+            # Tabela scrape_cache (hash, user_id, query_key, created_at)
+            for item in items:
+                source_val = item.get("source") or source
+                url_val = item.get("canonical_url") or item.get("url") or ""
+                content_val = (item.get("text") or "")[:100]
+                hash_str = f"{source_val}{url_val}{content_val}".encode('utf-8')
+                item["sha256_hash"] = hashlib.sha256(hash_str).hexdigest()
+
+            candidate_hashes = [item["sha256_hash"] for item in items]
+            
+            # Buscar no banco apenas para o user_id
+            existing = db.scrape_cache.find(
+                {
+                    "user_id": user_id,
+                    "hash": {"$in": candidate_hashes}
+                },
+                {"hash": 1}
+            )
+            for doc in existing:
+                existing_hashes.add(doc["hash"])
+
+        fresh: list[dict[str, Any]] = []
+        for item in items:
+            item_hash = item.get("sha256_hash")
+            if item_hash and item_hash in existing_hashes:
+                continue
+
+            if item_hash:
+                existing_hashes.add(item_hash)
+            
+            item["user_id"] = user_id
+            fresh.append(item)
+            if len(fresh) >= limit:
+                break
+
+        if fresh:
+            now = utcnow()
+            docs = [
+                {
+                    "source": source,
+                    "query": query,
+                    "query_key": query_key,
+                    "entity": item.get("entity") or query,
+                    "title": item.get("title"),
+                    "snippet": item.get("snippet"),
+                    "author": item.get("author"),
+                    "url": item.get("url"),
+                    "canonical_url": item.get("canonical_url"),
+                    "published_at": item.get("published_at"),
+                    "collected_at": item.get("collected_at"),
+                    "content_hash": item.get("content_hash"),
+                    "quality_score": item.get("quality_score"),
+                    "source_priority": item.get("source_priority"),
+                    "raw": item.get("raw") or {},
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                for item in fresh
+            ]
+            try:
+                db.scraped_items.insert_many(docs, ordered=False)
+                # Salva cache de hashes para dedupe do usuario
+                cache_docs = [
+                    {
+                        "hash": item.get("sha256_hash"),
+                        "user_id": user_id,
+                        "query_key": query_key,
+                        "created_at": now
+                    }
+                    for item in fresh if item.get("sha256_hash")
+                ]
+                if cache_docs:
+                    db.scrape_cache.insert_many(cache_docs, ordered=False)
+            except Exception as exc:
+                logger.warning("Persistencia incremental falhou para %s: %s", source, exc)
+
+        ScraperService._update_source_checkpoint(source=source, query=query, item_count=len(fresh), user_id=user_id)
+        return fresh
+
+    @staticmethod
+    def _update_source_checkpoint(source: str, query: str, item_count: int, user_id: str = "") -> None:
+        db = get_db()
+        if db is None:
+            return
+
+        now = utcnow()
+        source_config = SourceRegistryService.get_source_config(source)
+        db.source_checkpoints.update_one(
+            {"source": source, "query_key": query.strip().lower()},
+            {
+                "$set": {
+                    "source": source,
+                    "query": query,
+                    "query_key": query.strip().lower(),
+                    "item_count": int(item_count),
+                    "fetchMode": source_config.fetch_mode if source_config else None,
+                    "updatedAt": now,
+                    "lastCollectedAt": now,
+                },
+                "$setOnInsert": {"createdAt": now},
+            },
+            upsert=True,
+        )
+
+    @staticmethod
+    def _request(
+        url: str,
+        params: dict[str, Any] | None,
+        expect_json: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        headers = {
+            "User-Agent": settings.SCRAPER_USER_AGENT.strip(),
+            "Accept": "application/json,text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        if not headers["User-Agent"]:
+            headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+
+        timeout = max(5, int(settings.SCRAPER_TIMEOUT_SECONDS))
+        attempts = max(1, int(settings.SCRAPER_RETRY_ATTEMPTS))
+        base_delay = max(0.1, float(settings.SCRAPER_DELAY_SECONDS))
+        retry_backoff = max(0.2, float(settings.SCRAPER_RETRY_BACKOFF_SECONDS))
+
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=timeout)
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    raise RuntimeError(f"HTTP {response.status_code} em {response.url}")
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code} em {response.url}")
+
+                if expect_json:
+                    response.json()
+                return response
+            except Exception as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                time.sleep(base_delay + ((attempt - 1) * retry_backoff))
+
+        raise RuntimeError(str(last_error) if last_error else "Falha de rede desconhecida")
+
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        return " ".join((value or "").split())
+
+    @staticmethod
+    def _normalize_datetime(value: Any) -> str | None:
+        if not value:
+            return None
+
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            candidate = str(value).strip()
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                dt = datetime.fromisoformat(candidate)
+            except ValueError:
+                return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _looks_like_low_signal(text: str) -> bool:
+        lower = (text or "").strip().lower()
+        if not lower:
+            return True
+
+        if any(term in lower for term in ScraperService.LOW_SIGNAL_TERMS):
+            return True
+
+        tokens = [token for token in re.findall(r"[a-z0-9à-ÿ]+", lower, flags=re.IGNORECASE) if len(token) > 2]
+        if len(tokens) >= 8:
+            diversity = len(set(tokens)) / max(1, len(tokens))
+            if diversity < 0.35:
+                return True
+
+        return False
+
+    @staticmethod
+    def _quality_score(text: str, title: str, snippet: str) -> float:
+        length_score = min(len(text) / 260.0, 1.0)
+        title_bonus = 0.2 if title else 0.0
+        snippet_bonus = 0.2 if snippet else 0.0
+        signal_penalty = 0.3 if ScraperService._looks_like_low_signal(text) else 0.0
+        return max(0.0, min(1.0, (length_score * 0.6) + title_bonus + snippet_bonus - signal_penalty))
+
+    @staticmethod
+    def build_debug_search_url(query: str, source: str) -> str:
+        source = SourceRegistryService.normalize_source_name(source)
+        encoded = quote_plus(query.strip())
+
+        if source == "reclameaqui":
+            search_url = settings.SCRAPER_RECLAMEAQUI_SEARCH_URL
+            if "{query}" in search_url:
+                return search_url.format(query=encoded)
+            if search_url.endswith("="):
+                return f"{search_url}{encoded}"
+            separator = "&" if "?" in search_url else "?"
+            return f"{search_url}{separator}q={encoded}"
+        if source == "reddit":
+            return f"{settings.SCRAPER_REDDIT_URL.rstrip('/')}/search.json?q={encoded}&sort=new&t=month"
+        if source == "mastodon":
+            path = settings.SCRAPER_MASTODON_SEARCH_PATH
+            if not path.startswith("/"):
+                path = f"/{path}"
+            return f"{settings.SCRAPER_MASTODON_BASE_URL.rstrip('/')}{path}?q={encoded}&type=statuses"
+        if source == "web":
+            return f"{settings.SCRAPER_WEB_SEARCH_URL.rstrip('/')}?q={encoded}"
+
+        return ""

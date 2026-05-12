@@ -1,6 +1,21 @@
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from uuid import uuid4
+
+TRACKING_QUERY_PARAMS = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "gclid",
+    "fbclid",
+    "igshid",
+    "ref",
+    "ref_src",
+}
 
 
 def utcnow() -> datetime:
@@ -17,6 +32,72 @@ def make_search_id() -> str:
     return str(uuid4())
 
 
+def canonicalize_url(url: Optional[str]) -> str:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return ""
+
+    parsed = urlparse(raw_url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+
+    host = parsed.netloc.lower()
+    if ":" in host:
+        host = host.split(":", 1)[0]
+
+    path = parsed.path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/")
+
+    clean_query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+        if key.lower() not in TRACKING_QUERY_PARAMS
+    ]
+    clean_query.sort()
+
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            host,
+            path,
+            "",
+            urlencode(clean_query, doseq=True),
+            "",
+        )
+    )
+
+
+def compute_text_fingerprint(*, source: str, author: str, text: str) -> str:
+    normalized = f"{source.strip().lower()}|{author.strip().lower()}|{text.strip().lower()[:400]}"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def compute_content_hash(*, source: str, author: str, text: str, url: Optional[str] = None) -> str:
+    canonical_url = canonicalize_url(url)
+    seed = f"{source.strip().lower()}|{author.strip().lower()}|{text.strip().lower()[:500]}|{canonical_url}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _coerce_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        candidate = value.strip()
+        if candidate.endswith("Z"):
+            candidate = f"{candidate[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            dt = utcnow()
+    else:
+        dt = utcnow()
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def normalize_mention(
     *,
     query: str,
@@ -28,29 +109,78 @@ def normalize_mention(
     rating: Optional[float] = None,
     raw: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    """Normaliza qualquer dado de Google, Reddit ou X em um schema único.
-
-    Retorna None quando o texto estiver vazio, pois comentários vazios não devem
-    entrar no pipeline de IA nem nos relatórios.
-    """
-    clean_text = (text or "").strip()
+    """Normaliza qualquer item externo em um schema único e rastreável."""
+    clean_text = " ".join((text or "").split())
     if not clean_text:
         return None
 
-    if isinstance(published_at, datetime):
-        dt = published_at
-    else:
-        dt = utcnow()
+    dt = _coerce_datetime(published_at)
+    raw_payload = raw or {}
+
+    title = " ".join(str(raw_payload.get("title") or "").split())
+    body = " ".join(str(raw_payload.get("snippet") or "").split())
+
+    canonical_url = canonicalize_url(
+        str(raw_payload.get("canonical_url") or raw_payload.get("url") or url or "")
+    )
+    normalized_text = clean_text[:5000]
+    safe_source = str(source or "unknown").strip().lower()
+    safe_author = str(author or raw_payload.get("author") or "desconhecido")
+
+    source_item_id = str(
+        raw_payload.get("id")
+        or raw_payload.get("source_item_id")
+        or raw_payload.get("external_id")
+        or ""
+    ).strip()
+
+    content_hash = compute_content_hash(
+        source=safe_source,
+        author=safe_author,
+        text=normalized_text,
+        url=canonical_url,
+    )
+    text_fingerprint = compute_text_fingerprint(
+        source=safe_source,
+        author=safe_author,
+        text=normalized_text,
+    )
+
+    external_id = str(
+        source_item_id
+        or raw_payload.get("external_id")
+        or canonical_url
+        or url
+        or content_hash
+        or uuid4()
+    )
+
+    try:
+        source_priority = int(raw_payload.get("source_priority") or 0)
+    except (TypeError, ValueError):
+        source_priority = 0
+
+    collected_at = _coerce_datetime(raw_payload.get("collected_at") or utcnow())
 
     return {
-        "external_id": str((raw or {}).get("id") or (raw or {}).get("url") or url or uuid4()),
+        "external_id": external_id,
+        "source_item_id": source_item_id or None,
         "query": query,
-        "source": source,
-        "text": clean_text[:5000],
-        "author": author or "desconhecido",
+        "entity": query,
+        "source": safe_source,
+        "source_priority": source_priority,
+        "text": normalized_text,
+        "normalized_text": normalized_text,
+        "title": title,
+        "body": body,
+        "author": safe_author,
         "published_at": dt,
-        "url": url,
+        "collected_at": collected_at,
+        "url": canonical_url or url,
+        "canonical_url": canonical_url or None,
         "rating": rating,
-        "raw": raw or {},
+        "content_hash": content_hash,
+        "text_fingerprint": text_fingerprint,
+        "raw": raw_payload,
         "created_at": utcnow(),
     }

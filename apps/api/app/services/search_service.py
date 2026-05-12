@@ -7,7 +7,7 @@ from app.database import get_db
 from app.services.collector_service import CollectorService
 from app.services.enrichment_service import EnrichmentService
 from app.services.llm_service import LLMService
-from app.services.normalization_service import make_search_id, utcnow
+from app.services.normalization_service import canonicalize_url, make_search_id, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +81,11 @@ class SearchService:
         })
 
         collected, errors = await CollectorService.collect(query, sources, period_days=period_days, locality=locality)
+        collected = SearchService._dedupe_mentions_in_memory(collected)
 
         enriched_mentions: list[dict[str, Any]] = []
-        seen = set()
         cutoff = now - timedelta(days=max(1, int(period_days)))
+        existing_signatures = SearchService._load_existing_signatures(db=db, user_id=user_id, mentions=collected)
 
         for mention in collected:
             published_at = mention.get("published_at")
@@ -95,25 +96,30 @@ class SearchService:
                 if published_at < cutoff:
                     continue
 
-            # Deduplicação simples por fonte + texto + autor.
-            fingerprint = (
-                mention.get("source"),
-                (mention.get("author") or "").lower(),
-                (mention.get("text") or "")[:160].lower(),
-            )
-            if fingerprint in seen:
+            signature = SearchService._mention_signature(mention)
+            if SearchService._signature_exists(signature, existing_signatures):
                 continue
-            seen.add(fingerprint)
 
             enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
+            mention_rank_score = SearchService._rank_mention(mention, enrichment)
             mention.update(enrichment)
             mention.update({
                 "search_id": search_id,
                 "user_id": user_id,
                 "query": query,
+                "mention_rank_score": mention_rank_score,
                 "created_at": utcnow(),
             })
             enriched_mentions.append(mention)
+            SearchService._remember_signature(signature, existing_signatures)
+
+        enriched_mentions.sort(
+            key=lambda item: (
+                float(item.get("mention_rank_score") or 0),
+                str(item.get("published_at") or ""),
+            ),
+            reverse=True,
+        )
 
         if enriched_mentions:
             db.mentions.insert_many(enriched_mentions)
@@ -253,3 +259,145 @@ class SearchService:
             else:
                 output[k] = v
         return output
+
+    @staticmethod
+    def _dedupe_mentions_in_memory(mentions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique_items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for mention in mentions:
+            signature = SearchService._mention_signature(mention)
+            dedupe_key = (
+                signature.get("content_hash")
+                or signature.get("canonical_url")
+                or signature.get("text_fingerprint")
+                or signature.get("external_id")
+                or signature.get("fallback")
+            )
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            unique_items.append(mention)
+
+        return unique_items
+
+    @staticmethod
+    def _load_existing_signatures(
+        *,
+        db,
+        user_id: str,
+        mentions: list[dict[str, Any]],
+    ) -> dict[str, set[str]]:
+        signatures = {
+            "external_id": set(),
+            "text_fingerprint": set(),
+            "content_hash": set(),
+            "canonical_url": set(),
+            "fallback": set(),
+        }
+
+        external_ids = sorted({str(item.get("external_id") or "").strip() for item in mentions if item.get("external_id")})
+        text_fingerprints = sorted(
+            {str(item.get("text_fingerprint") or "").strip() for item in mentions if item.get("text_fingerprint")}
+        )
+        content_hashes = sorted({str(item.get("content_hash") or "").strip() for item in mentions if item.get("content_hash")})
+        canonical_urls = sorted(
+            {
+                normalized_url
+                for item in mentions
+                for normalized_url in [canonicalize_url(str(item.get("canonical_url") or item.get("url") or ""))]
+                if normalized_url
+            }
+        )
+
+        or_filters: list[dict[str, Any]] = []
+        if external_ids:
+            or_filters.append({"external_id": {"$in": external_ids}})
+        if text_fingerprints:
+            or_filters.append({"text_fingerprint": {"$in": text_fingerprints}})
+        if content_hashes:
+            or_filters.append({"content_hash": {"$in": content_hashes}})
+        if canonical_urls:
+            or_filters.append({"canonical_url": {"$in": canonical_urls}})
+
+        if not or_filters:
+            return signatures
+
+        existing = db.mentions.find(
+            {
+                "user_id": user_id,
+                "$or": or_filters,
+            },
+            {
+                "external_id": 1,
+                "text_fingerprint": 1,
+                "content_hash": 1,
+                "canonical_url": 1,
+            },
+        )
+
+        for item in existing:
+            for key in ["external_id", "text_fingerprint", "content_hash", "canonical_url"]:
+                value = str(item.get(key) or "").strip()
+                if value:
+                    signatures[key].add(value)
+
+        return signatures
+
+    @staticmethod
+    def _mention_signature(mention: dict[str, Any]) -> dict[str, str]:
+        source = str(mention.get("source") or "").strip().lower()
+        author = str(mention.get("author") or "").strip().lower()
+        text = str(mention.get("text") or "").strip().lower()
+
+        external_id = str(mention.get("external_id") or "").strip()
+        text_fingerprint = str(mention.get("text_fingerprint") or "").strip()
+        content_hash = str(mention.get("content_hash") or "").strip()
+        canonical_url = canonicalize_url(str(mention.get("canonical_url") or mention.get("url") or ""))
+        fallback = f"{source}|{author}|{text[:220]}"
+
+        return {
+            "external_id": external_id,
+            "text_fingerprint": text_fingerprint,
+            "content_hash": content_hash,
+            "canonical_url": canonical_url,
+            "fallback": fallback,
+        }
+
+    @staticmethod
+    def _signature_exists(signature: dict[str, str], signatures: dict[str, set[str]]) -> bool:
+        for key in ["external_id", "text_fingerprint", "content_hash", "canonical_url", "fallback"]:
+            value = signature.get(key) or ""
+            if value and value in signatures[key]:
+                return True
+        return False
+
+    @staticmethod
+    def _remember_signature(signature: dict[str, str], signatures: dict[str, set[str]]) -> None:
+        for key in ["external_id", "text_fingerprint", "content_hash", "canonical_url", "fallback"]:
+            value = signature.get(key) or ""
+            if value:
+                signatures[key].add(value)
+
+    @staticmethod
+    def _rank_mention(mention: dict[str, Any], enrichment: dict[str, Any]) -> float:
+        source_weight = float(mention.get("source_priority") or 50)
+        quality_component = float(mention.get("quality_score") or 0) * 30
+
+        criticality = str(enrichment.get("criticality") or "").lower()
+        criticality_bonus = 0.0
+        if criticality == "alta":
+            criticality_bonus = 20.0
+        elif criticality == "media":
+            criticality_bonus = 10.0
+
+        recency_bonus = 0.0
+        published_at = mention.get("published_at")
+        if isinstance(published_at, datetime):
+            now = utcnow()
+            if published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=now.tzinfo)
+            age_days = max(0.0, (now - published_at).total_seconds() / 86400)
+            recency_bonus = max(0.0, 15.0 - min(15.0, age_days))
+
+        return round(source_weight + quality_component + criticality_bonus + recency_bonus, 3)

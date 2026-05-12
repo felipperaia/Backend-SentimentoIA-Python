@@ -22,14 +22,32 @@ class CriticalityLevel(str, Enum):
 
 
 class DataSource(str, Enum):
+    RECLAMEAQUI = "reclameaqui"
+    REDDIT = "reddit"
+    MASTODON = "mastodon"
+    WEB = "web"
+
+    # Legado
     GOOGLE = "google"
+    X = "x"
+    TWITTER = "twitter"
+
+    # Compatibilidade adicional
     TRUSTPILOT = "trustpilot"
     YELP = "yelp"
     TRIPADVISOR = "tripadvisor"
     INSTAGRAM = "instagram"
-    TWITTER = "x"
-    REDDIT = "reddit"
     FACEBOOK = "facebook"
+
+
+class ScrapeSource(str, Enum):
+    RECLAMEAQUI = "reclameaqui"
+    GOOGLE = "google"
+    REDDIT = "reddit"
+    MASTODON = "mastodon"
+    WEB = "web"
+    X = "x"
+    TWITTER = "twitter"
 
 
 # ==================== USER MODELS ====================
@@ -317,3 +335,9 @@ class SearchResponse(BaseModel):
     status: str
     mentions_found: int
     created_at: datetime
+
+
+class ScrapeRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=160)
+    sources: List[ScrapeSource] = Field(default_factory=lambda: [ScrapeSource.RECLAMEAQUI, ScrapeSource.REDDIT, ScrapeSource.MASTODON])
+    limit_per_source: int = Field(default=5, ge=1, le=10)

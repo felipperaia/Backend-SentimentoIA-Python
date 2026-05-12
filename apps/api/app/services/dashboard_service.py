@@ -19,13 +19,16 @@ class DashboardService:
         if db is None:
             raise RuntimeError("Banco de dados indisponivel")
 
-        query: dict[str, Any] = {
-            "user_id": user_id,
-            "status": "processed",
-            "batch_id": {"$exists": True},
-        }
+        # Busca por batch_id OU search_id (ambos os fluxos)
+        query: dict[str, Any] = {"user_id": user_id}
         if batch_id:
-            query["batch_id"] = batch_id
+            query["$or"] = [{"batch_id": batch_id}, {"search_id": batch_id}]
+        else:
+            # Aceita mencoes de qualquer fluxo
+            query["$or"] = [
+                {"batch_id": {"$exists": True}, "status": "processed"},
+                {"search_id": {"$exists": True}},
+            ]
 
         if period_days and period_days > 0:
             cutoff = utcnow() - timedelta(days=period_days)
@@ -59,15 +62,28 @@ class DashboardService:
         metrics = EnrichmentService.aggregate(mentions)
         metrics["total_comments"] = metrics.get("total_mentions", 0)
 
-        selected_batch_id = batch_id or str(mentions[0].get("batch_id") or "")
-        latest_insight_query: dict[str, Any] = {
-            "user_id": user_id,
-            "archived": False,
-        }
-        if selected_batch_id:
-            latest_insight_query["batch_id"] = selected_batch_id
+        # Identifica batch/search ID do contexto
+        selected_batch_id = batch_id
+        if not selected_batch_id:
+            selected_batch_id = str(
+                mentions[0].get("batch_id") or mentions[0].get("search_id") or ""
+            )
 
-        latest_insight = db.insights.find_one(latest_insight_query, sort=[("created_at", -1)])
+        # Busca insight mais recente
+        insight_query: dict[str, Any] = {"user_id": user_id, "archived": False}
+        if selected_batch_id:
+            insight_query["batch_id"] = selected_batch_id
+        latest_insight = db.insights.find_one(insight_query, sort=[("created_at", -1)])
+
+        # Se nao encontrou insight por batch_id, tenta buscar llm_analysis do search_job
+        llm_analysis = None
+        if not latest_insight and selected_batch_id:
+            search_job = db.search_jobs.find_one(
+                {"user_id": user_id, "search_id": selected_batch_id, "status": "completed"},
+                {"llm_analysis": 1},
+            )
+            if search_job and search_job.get("llm_analysis"):
+                llm_analysis = search_job["llm_analysis"]
 
         return {
             "search_id": selected_batch_id or None,
@@ -75,6 +91,7 @@ class DashboardService:
             "metrics": metrics,
             "mentions": SearchService.serialize_many(mentions),
             "latest_insight": SearchService.serialize(latest_insight) if latest_insight else None,
+            "llm_analysis": llm_analysis,
         }
 
     @staticmethod
@@ -89,13 +106,16 @@ class DashboardService:
         if db is None:
             raise RuntimeError("Banco de dados indisponivel")
 
-        query: dict[str, Any] = {
-            "user_id": user_id,
-            "batch_id": {"$exists": True},
-            "status": status,
-        }
+        query: dict[str, Any] = {"user_id": user_id}
         if batch_id:
-            query["batch_id"] = batch_id
+            query["$or"] = [{"batch_id": batch_id}, {"search_id": batch_id}]
+        else:
+            query["$or"] = [
+                {"batch_id": {"$exists": True}},
+                {"search_id": {"$exists": True}},
+            ]
+        if status:
+            query["status"] = status
         if sentiment:
             query["sentiment"] = sentiment
 

@@ -22,7 +22,6 @@ email-validator
 qrcode[pil]
 textblob
 pytest
-snscrape
 
 beautifulsoup4
 
