@@ -117,7 +117,26 @@ def test_main_flow_end_to_end(client, monkeypatch):
 
     insights_list = client.get("/api/insights", headers=headers)
     assert insights_list.status_code == 200, insights_list.text
-    assert len(insights_list.json().get("items", [])) >= 1
+    items = insights_list.json().get("items", [])
+    assert len(items) >= 1
+    first = items[0]
+    assert first.get("priority") in {"high", "medium", "low"}
+    assert first.get("resolution") in {"pending", "in_progress", "resolved"}
+
+    filtered_insights = client.get(
+        "/api/insights",
+        headers=headers,
+        params={"priority": first.get("priority"), "resolution": first.get("resolution")},
+    )
+    assert filtered_insights.status_code == 200, filtered_insights.text
+
+    export_md = client.get("/api/insights/export/markdown", headers=headers)
+    assert export_md.status_code == 200, export_md.text
+    assert "text/markdown" in export_md.headers.get("content-type", "")
+
+    export_pdf = client.get("/api/insights/export/pdf", headers=headers)
+    assert export_pdf.status_code == 200, export_pdf.text
+    assert "application/pdf" in export_pdf.headers.get("content-type", "")
 
     thread_response = client.post("/api/chat/threads", headers=headers, json={"title": "Suporte"})
     assert thread_response.status_code == 200, thread_response.text
@@ -138,6 +157,22 @@ def test_main_flow_end_to_end(client, monkeypatch):
     )
     assert chat_out_scope.status_code == 200, chat_out_scope.text
     assert "Posso ajudar apenas" in chat_out_scope.json()["assistant_message"]["content"]
+
+    thread_messages = client.get(f"/api/chat/threads/{thread_id}/messages", headers=headers)
+    assert thread_messages.status_code == 200, thread_messages.text
+    items_messages = thread_messages.json().get("items", [])
+    assert len(items_messages) >= 2
+    first_message_id = items_messages[0].get("message_id") or items_messages[0].get("id")
+    assert first_message_id
+
+    delete_one_message = client.delete(
+        f"/api/chat/threads/{thread_id}/messages/{first_message_id}",
+        headers=headers,
+    )
+    assert delete_one_message.status_code == 200, delete_one_message.text
+
+    delete_thread = client.delete(f"/api/chat/threads/{thread_id}", headers=headers)
+    assert delete_thread.status_code == 200, delete_thread.text
 
     settings_get = client.get("/api/settings", headers=headers)
     assert settings_get.status_code == 200, settings_get.text

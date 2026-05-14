@@ -188,6 +188,64 @@ class ChatService:
         return [ChatService._serialize_message(item) for item in items]
 
     @staticmethod
+    def delete_thread(user_id: str, thread_id: str) -> bool:
+        db = get_db()
+        if db is None:
+            raise RuntimeError(DB_UNAVAILABLE_ERROR)
+
+        thread = db.chat_threads.find_one(
+            {
+                "user_id": user_id,
+                "$or": [{"_id": thread_id}, {"thread_id": thread_id}],
+            }
+        )
+        if not thread:
+            raise ValueError("Thread nao encontrada")
+
+        resolved_thread_id = str(thread.get("thread_id") or thread.get("_id"))
+        db.chat_messages.delete_many({"user_id": user_id, "thread_id": resolved_thread_id})
+        result = db.chat_threads.delete_one({"_id": thread.get("_id"), "user_id": user_id})
+        return result.deleted_count > 0
+
+    @staticmethod
+    def delete_message(user_id: str, thread_id: str, message_id: str) -> bool:
+        db = get_db()
+        if db is None:
+            raise RuntimeError(DB_UNAVAILABLE_ERROR)
+
+        thread = db.chat_threads.find_one(
+            {
+                "user_id": user_id,
+                "$or": [{"_id": thread_id}, {"thread_id": thread_id}],
+            }
+        )
+        if not thread:
+            raise ValueError("Thread nao encontrada")
+
+        resolved_thread_id = str(thread.get("thread_id") or thread.get("_id"))
+        result = db.chat_messages.delete_one(
+            {
+                "user_id": user_id,
+                "thread_id": resolved_thread_id,
+                "$or": [{"_id": message_id}, {"message_id": message_id}],
+            }
+        )
+        return result.deleted_count > 0
+
+    @staticmethod
+    def delete_all_threads(user_id: str) -> dict[str, int]:
+        db = get_db()
+        if db is None:
+            raise RuntimeError(DB_UNAVAILABLE_ERROR)
+
+        deleted_threads = db.chat_threads.delete_many({"user_id": user_id}).deleted_count
+        deleted_messages = db.chat_messages.delete_many({"user_id": user_id}).deleted_count
+        return {
+            "deleted_threads": int(deleted_threads),
+            "deleted_messages": int(deleted_messages),
+        }
+
+    @staticmethod
     def _authorized_context(user_id: str) -> dict[str, Any]:
         db = get_db()
         if db is None:

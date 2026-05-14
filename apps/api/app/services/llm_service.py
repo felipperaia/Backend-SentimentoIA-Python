@@ -67,6 +67,16 @@ class LLMService:
             raise RuntimeError(f"Ollama Cloud: erro HTTP {status}.")
 
     @staticmethod
+    def _safe_json(resp: httpx.Response) -> dict[str, Any]:
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise RuntimeError("Ollama Cloud retornou payload nao-JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Ollama Cloud retornou payload invalido")
+        return payload
+
+    @staticmethod
     async def _call_ollama(prompt: str, model: str | None = None) -> dict[str, Any]:
         url = LLMService._build_ollama_url("generate")
         timeout = max(10, int(settings.OLLAMA_TIMEOUT_SECONDS))
@@ -90,7 +100,7 @@ class LLMService:
                 json=payload,
             )
             LLMService._handle_ollama_error(resp)
-            content = resp.json().get("response", "")
+            content = LLMService._safe_json(resp).get("response", "")
             logger.info("Ollama Cloud response OK (%d chars)", len(content))
             return LLMService._parse_json(content)
 
@@ -117,7 +127,7 @@ class LLMService:
                 json=payload,
             )
             LLMService._handle_ollama_error(resp)
-            return str(resp.json().get("response", "")).strip()
+            return str(LLMService._safe_json(resp).get("response", "")).strip()
 
     @staticmethod
     def _parse_json(content: str) -> dict[str, Any]:
@@ -142,6 +152,12 @@ class LLMService:
             "recommended_actions": [],
             "decision_guidance": reason,
             "trend": "indefinido",
+            "priority": "medium",
+            "urgency": "medium",
+            "root_cause": "indefinido",
+            "recommended_action": "Revisar dados recentes e priorizar tratativas criticas.",
+            "status": "open",
+            "resolution": "pending",
         }
 
     @staticmethod
@@ -157,6 +173,12 @@ class LLMService:
             "recommended_actions": data.get("recommended_actions")
             if isinstance(data.get("recommended_actions"), list)
             else [],
+            "priority": str(data.get("priority") or base["priority"]),
+            "urgency": str(data.get("urgency") or base["urgency"]),
+            "root_cause": str(data.get("root_cause") or base["root_cause"]),
+            "recommended_action": str(data.get("recommended_action") or base["recommended_action"]),
+            "status": str(data.get("status") or base["status"]),
+            "resolution": str(data.get("resolution") or base["resolution"]),
         })
         return base
 
@@ -167,7 +189,8 @@ class LLMService:
             "Seu foco e orientar tomada de decisao executiva. "
             "Retorne SOMENTE JSON valido com as chaves: "
             "executive_summary, sentiment_overview, risks, opportunities, "
-            "recommended_actions, decision_guidance, trend.\n\n"
+            "recommended_actions, decision_guidance, trend, priority, urgency, "
+            "root_cause, recommended_action, status, resolution.\n\n"
             f"Contexto:\n{json.dumps(snapshot, ensure_ascii=False)}"
         )
 
@@ -318,5 +341,5 @@ class LLMService:
                     logger.warning(f"Ollama nao acessivel em {tags_url}. Verifique OLLAMA_BASE_URL no .env. HTTP {resp.status_code}")
                 else:
                     logger.info("✓ Conexao com Ollama Cloud validada com sucesso")
-        except Exception as exc:
+        except (httpx.HTTPError, httpx.TimeoutException, RuntimeError) as exc:
             logger.warning(f"Ollama nao acessivel em {tags_url}. Verifique OLLAMA_BASE_URL no .env. Detalhes: {exc}")

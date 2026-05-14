@@ -108,14 +108,14 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SentimentoIA API",
-    description="Backend com scraping (Reclame Aqui, Reddit, Mastodon e Web aberto), Ollama Cloud e MongoDB.",
+    description="Backend com scraping (Reclame Aqui, Reddit e Web aberto), Ollama Cloud e MongoDB.",
     version="2.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.CORS_ORIGINS_EFFECTIVE,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -177,7 +177,7 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
     Entrada esperada:
     {
       "brand_name": "Nike",
-            "sources": ["reclameaqui", "reddit", "mastodon"],
+                        "sources": ["reclameaqui", "reddit", "web"],
       "period_days": 30,
       "locality": "São Paulo",
       "replace_existing": false
@@ -260,6 +260,8 @@ async def mentions(
 async def insights(
     batch_id: str | None = Query(None),
     include_archived: bool = Query(False),
+    priority: str | None = Query(None),
+    resolution: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
@@ -270,6 +272,8 @@ async def insights(
         include_archived=include_archived,
         limit=limit,
         batch_id=batch_id,
+        priority=priority,
+        resolution=resolution,
     )
     return {"items": items}
 
@@ -390,6 +394,49 @@ async def list_chat_messages(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"items": items}
+
+
+@app.delete("/api/chat/threads/{thread_id}")
+async def delete_chat_thread(
+    thread_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exclui uma thread de chat e todas as suas mensagens (escopo do usuário)."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        deleted = ChatService.delete_thread(user_id=user_id, thread_id=thread_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Thread nao encontrada")
+    return {"ok": True}
+
+
+@app.delete("/api/chat/threads/{thread_id}/messages/{message_id}")
+async def delete_chat_thread_message(
+    thread_id: str,
+    message_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exclui uma mensagem da thread do usuário."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        deleted = ChatService.delete_message(user_id=user_id, thread_id=thread_id, message_id=message_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Mensagem nao encontrada")
+    return {"ok": True}
+
+
+@app.delete("/api/chat/threads")
+async def delete_all_chat_threads(
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exclui todas as threads e mensagens de chat do usuário autenticado."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    result = ChatService.delete_all_threads(user_id=user_id)
+    return {"ok": True, **result}
 
 
 @app.post("/api/chat/threads/{thread_id}/messages")
@@ -518,6 +565,40 @@ async def export_latest_report(
     raise HTTPException(status_code=400, detail="Formato inválido. Use csv ou pdf")
 
 
+@app.get("/api/insights/export/markdown")
+async def export_insights_markdown(
+    priority: str | None = Query(None),
+    resolution: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exporta insights filtrados em Markdown."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    return ReportService.export_insights_markdown(
+        user_id=user_id,
+        priority=priority,
+        resolution=resolution,
+        limit=limit,
+    )
+
+
+@app.get("/api/insights/export/pdf")
+async def export_insights_pdf(
+    priority: str | None = Query(None),
+    resolution: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exporta insights filtrados em PDF executivo."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    return ReportService.export_insights_pdf(
+        user_id=user_id,
+        priority=priority,
+        resolution=resolution,
+        limit=limit,
+    )
+
+
 @app.delete("/api/dev/clear-data")
 async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
     """Limpa dados do usuário logado.
@@ -556,31 +637,30 @@ async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
 @app.delete("/api/conversations/{id}")
 async def delete_conversation(id: str, current_user: dict[str, Any] = Depends(get_current_user)):
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    db = get_db()
-    result = db.chat_threads.delete_one({"_id": id, "user_id": user_id})
-    if result.deleted_count == 0:
-        result = db.chat_threads.delete_one({"thread_id": id, "user_id": user_id})
-    if result.deleted_count == 0:
+    try:
+        deleted = ChatService.delete_thread(user_id=user_id, thread_id=id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="Conversa não encontrada")
-    db.chat_messages.delete_many({"thread_id": id, "user_id": user_id})
     return {"ok": True}
 
 @app.delete("/api/conversations/{id}/messages/{msg_id}")
 async def delete_message(id: str, msg_id: str, current_user: dict[str, Any] = Depends(get_current_user)):
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    db = get_db()
-    result = db.chat_messages.delete_one({"_id": msg_id, "thread_id": id, "user_id": user_id})
-    if result.deleted_count == 0:
+    try:
+        deleted = ChatService.delete_message(user_id=user_id, thread_id=id, message_id=msg_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="Mensagem não encontrada")
     return {"ok": True}
 
 @app.delete("/api/conversations/all")
 async def delete_all_conversations(current_user: dict[str, Any] = Depends(get_current_user)):
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    db = get_db()
-    db.chat_threads.delete_many({"user_id": user_id})
-    db.chat_messages.delete_many({"user_id": user_id})
-    return {"ok": True}
+    result = ChatService.delete_all_threads(user_id=user_id)
+    return {"ok": True, **result}
 
 @app.delete("/api/searches/{id}")
 async def delete_search(id: str, current_user: dict[str, Any] = Depends(get_current_user)):

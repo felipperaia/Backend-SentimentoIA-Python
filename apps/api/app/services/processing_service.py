@@ -131,9 +131,10 @@ class ProcessingService:
             # Enfileira insight automatico quando o batch processado atingir o limiar configurado.
             InsightService.enqueue_job_if_threshold_reached(
                 user_id=user_id,
-                batch_id=batch_id,
+                context_id=batch_id,
                 trigger="auto",
                 force=False,
+                context_type="batch",
             )
 
         return {

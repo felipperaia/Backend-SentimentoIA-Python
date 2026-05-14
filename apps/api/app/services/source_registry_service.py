@@ -55,11 +55,12 @@ class SourceRegistryService:
                 name="mastodon",
                 source_type="federated_social",
                 base_url=settings.SCRAPER_MASTODON_BASE_URL.rstrip("/"),
-                active=True,
+                active=False,
                 priority=80,
                 fetch_mode="json_api",
                 rate_limit_per_minute=30,
                 parser="mastodon_status_parser",
+                deprecated=True,
             ),
             "web": SourceConfig(
                 name="web",
@@ -118,7 +119,7 @@ class SourceRegistryService:
         if selected:
             return selected
 
-        fallback = ["reclameaqui", "reddit", "mastodon"]
+        fallback = ["reclameaqui", "reddit", "web"]
         return [source for source in fallback if source in definitions and definitions[source].active]
 
     @staticmethod
@@ -157,7 +158,7 @@ class SourceRegistryService:
             if not config.active:
                 message = "Fonte despriorizada e inativa no nucleo atual"
                 if config.deprecated:
-                    message = "Fonte legada removida do nucleo. Use Reddit, Reclame Aqui, Mastodon ou Web"
+                    message = "Fonte legada removida do nucleo. Use Reddit, Reclame Aqui ou Web"
                 errors.append({"source": source, "error": message})
                 continue
 

@@ -4,11 +4,14 @@ from app.services.scraper_service import ScraperService
 
 
 def test_scrape_endpoint_returns_grouped_results(client, monkeypatch) -> None:
-    def fake_scrape(query: str, sources: list[str], limit_per_source: int | None = None):
-        del query
+    captured: dict[str, str | None] = {}
+
+    def fake_scrape(query: str, sources: list[str], limit_per_source: int | None = None, user_id: str | None = None):
+        captured["query"] = query
+        captured["user_id"] = user_id
         return {
             "query": "SentimentoIA",
-            "sources": ["reclameaqui", "reddit", "mastodon"],
+            "sources": ["reclameaqui", "reddit", "web"],
             "limit_per_source": limit_per_source or 5,
             "total": 2,
             "results": {
@@ -32,11 +35,11 @@ def test_scrape_endpoint_returns_grouped_results(client, monkeypatch) -> None:
                         "published_at": None,
                     }
                 ],
-                "mastodon": [],
+                "web": [],
             },
             "errors": [
                 {
-                    "source": "mastodon",
+                    "source": "web",
                     "error": "Fonte indisponivel no momento",
                 }
             ],
@@ -64,7 +67,7 @@ def test_scrape_endpoint_returns_grouped_results(client, monkeypatch) -> None:
         headers=headers,
         json={
             "query": "SentimentoIA",
-            "sources": ["reclameaqui", "reddit", "mastodon"],
+            "sources": ["reclameaqui", "reddit", "web"],
             "limit_per_source": 3,
         },
     )
@@ -74,4 +77,6 @@ def test_scrape_endpoint_returns_grouped_results(client, monkeypatch) -> None:
     assert payload["total"] == 2
     assert len(payload["results"]["reclameaqui"]) == 1
     assert len(payload["results"]["reddit"]) == 1
-    assert payload["errors"][0]["source"] == "mastodon"
+    assert payload["errors"][0]["source"] == "web"
+    assert captured.get("query") == "SentimentoIA"
+    assert bool(captured.get("user_id"))

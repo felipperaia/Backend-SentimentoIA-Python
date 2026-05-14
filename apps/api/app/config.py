@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     SCRAPER_DELAY_SECONDS: float = 1.0
     SCRAPER_TIMEOUT_SECONDS: int = 20
     SCRAPER_DEFAULT_LIMIT: int = 5
-    SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,mastodon"
+    SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,web"
     SCRAPER_MAX_ITEMS_PER_SOURCE: int = 10
     SCRAPER_MAX_TOTAL_ITEMS: int = 50
     SCRAPER_MAX_PAGES_PER_SOURCE: int = 2
@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     PUBLIC_ERROR_VERBOSE: bool = False
 
     # CORS local
+    CORS_ORIGINS_CSV: str = ""
     CORS_ORIGINS: list = [
         "http://localhost:3000",
         "http://localhost:3001",
@@ -147,6 +148,54 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
+
+    @property
+    def IS_PRODUCTION(self) -> bool:
+        return (self.ENV or "").strip().lower() in {"production", "prod", "release"}
+
+    @staticmethod
+    def _normalize_origin(origin: str) -> str:
+        value = str(origin or "").strip().rstrip("/")
+        if not value:
+            return ""
+        if not value.startswith(("http://", "https://")):
+            return ""
+        return value
+
+    @property
+    def CORS_ORIGINS_EFFECTIVE(self) -> list[str]:
+        """Resolve origens CORS de forma segura para deploy.
+
+        Regras:
+        - Sempre considera FRONTEND_URL quando valido.
+        - Aceita override por CORS_ORIGINS_CSV (separado por virgula).
+        - Em producao, remove localhost/127.0.0.1 automaticamente.
+        """
+        candidates: list[str] = []
+
+        if isinstance(self.CORS_ORIGINS, list):
+            candidates.extend(str(item) for item in self.CORS_ORIGINS)
+
+        csv_origins = [item.strip() for item in str(self.CORS_ORIGINS_CSV or "").split(",") if item.strip()]
+        candidates.extend(csv_origins)
+
+        if self.FRONTEND_URL:
+            candidates.append(self.FRONTEND_URL)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            normalized = self._normalize_origin(item)
+            if not normalized:
+                continue
+            lowered = normalized.lower()
+            if self.IS_PRODUCTION and ("localhost" in lowered or "127.0.0.1" in lowered):
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                deduped.append(normalized)
+
+        return deduped
 
     # Limites operacionais
     MAX_TEXT_LENGTH: int = 5000

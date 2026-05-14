@@ -12,7 +12,13 @@ class CollectorService:
     """Converte itens do ScraperService em menções normalizadas para o pipeline."""
 
     @staticmethod
-    async def collect(query: str, sources: list[str], period_days: int = 30, locality: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    async def collect(
+        query: str,
+        sources: list[str],
+        period_days: int = 30,
+        locality: str | None = None,
+        user_id: str = "",
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         del period_days
         term = f"{query} {locality}".strip() if locality else query
         mentions: list[dict[str, Any]] = []
@@ -23,6 +29,7 @@ class CollectorService:
                 ScraperService.scrape,
                 query=term,
                 sources=sources,
+                user_id=user_id,
             )
         except Exception as exc:
             logger.exception("Falha geral na coleta por scraping")

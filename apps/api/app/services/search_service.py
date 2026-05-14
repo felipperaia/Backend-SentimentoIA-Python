@@ -80,7 +80,13 @@ class SearchService:
             "errors": [],
         })
 
-        collected, errors = await CollectorService.collect(query, sources, period_days=period_days, locality=locality)
+        collected, errors = await CollectorService.collect(
+            query,
+            sources,
+            period_days=period_days,
+            locality=locality,
+            user_id=user_id,
+        )
         collected = SearchService._dedupe_mentions_in_memory(collected)
 
         enriched_mentions: list[dict[str, Any]] = []

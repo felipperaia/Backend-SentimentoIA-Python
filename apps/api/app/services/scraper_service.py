@@ -54,7 +54,6 @@ class ScraperService:
         handlers = {
             "reclameaqui": ScraperService._scrape_reclameaqui,
             "reddit": ScraperService._scrape_reddit,
-            "mastodon": ScraperService._scrape_mastodon,
             "web": ScraperService._scrape_web,
         }
 
@@ -114,7 +113,7 @@ class ScraperService:
         if relevance_threshold > 0:
             raw_items = [i for i in raw_items if ScraperService._relevance_check(query, i.get('title',''), i.get('snippet','')) >= relevance_threshold]
         normalized = ScraperService._normalize_items(source, query, raw_items)
-        filtered = ScraperService._dedupe_and_persist(source, query, normalized, limit)
+        filtered = ScraperService._dedupe_and_persist(source, query, normalized, limit, user_id=user_id)
         return filtered, source_error if source_error and not filtered else None
 
     @staticmethod
@@ -311,8 +310,94 @@ class ScraperService:
                 break
                 
         if not items:
+            browser_items = ScraperService._scrape_reclameaqui_browser_fallback(
+                query=query,
+                limit=limit,
+                base_url=base_url,
+                seen_urls=seen_urls,
+            )
+            if browser_items:
+                return browser_items, None
             return [], "Reclame Aqui sem resultados"
         return items, None
+
+    @staticmethod
+    def _scrape_reclameaqui_browser_fallback(
+        query: str,
+        limit: int,
+        base_url: str,
+        seen_urls: set[str],
+    ) -> list[dict[str, Any]]:
+        """Fallback opcional com browser headless quando HTML estatico nao retorna resultados."""
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            # Dependencia opcional: sem playwright, segue sem fallback de browser.
+            return []
+
+        import unicodedata
+
+        slug = unicodedata.normalize("NFKD", query).encode("ASCII", "ignore").decode("utf-8")
+        slug = slug.lower().replace(" ", "-")
+        slug = re.sub(r"[^a-z0-9-]", "", slug)
+
+        items: list[dict[str, Any]] = []
+        targets = [
+            f"{base_url}/empresa/{slug}/",
+            f"{settings.SCRAPER_RECLAMEAQUI_SEARCH_URL.strip()}{quote_plus(query)}",
+        ]
+
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                context = browser.new_context(user_agent=settings.SCRAPER_USER_AGENT.strip())
+                page = context.new_page()
+                page.set_default_timeout(max(5000, int(settings.SCRAPER_TIMEOUT_SECONDS) * 1000))
+
+                for target in targets:
+                    try:
+                        page.goto(target, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1200)
+                        links = page.eval_on_selector_all(
+                            "a[href*='/reclamacao/']",
+                            "els => els.map(e => ({ href: e.getAttribute('href') || '', text: (e.textContent || '').trim() }))",
+                        )
+                        for link in links:
+                            href = str((link or {}).get("href") or "").strip()
+                            title = ScraperService._clean_text(str((link or {}).get("text") or ""))
+                            if not href or not title:
+                                continue
+
+                            item_url = canonicalize_url(urljoin(base_url, href))
+                            if not item_url or item_url in seen_urls:
+                                continue
+
+                            seen_urls.add(item_url)
+                            items.append(
+                                {
+                                    "id": item_url,
+                                    "title": title,
+                                    "snippet": "",
+                                    "url": item_url,
+                                    "author": None,
+                                    "published_at": None,
+                                    "raw": {"collector": "playwright"},
+                                }
+                            )
+                            if len(items) >= limit:
+                                break
+                    except Exception as exc:
+                        logger.info("ReclameAqui fallback browser falhou em %s: %s", target, exc)
+                    if len(items) >= limit:
+                        break
+
+                context.close()
+                browser.close()
+        except Exception as exc:
+            logger.info("Playwright indisponivel para fallback ReclameAqui: %s", exc)
+            return []
+
+        return items[:limit]
 
     @staticmethod
     def _scrape_mastodon(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
@@ -646,7 +731,9 @@ class ScraperService:
             now = utcnow()
             docs = [
                 {
+                    "user_id": user_id,
                     "source": source,
+                    "company": query,
                     "query": query,
                     "query_key": query_key,
                     "entity": item.get("entity") or query,
@@ -661,6 +748,7 @@ class ScraperService:
                     "quality_score": item.get("quality_score"),
                     "source_priority": item.get("source_priority"),
                     "raw": item.get("raw") or {},
+                    "scraped_at": now,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -695,9 +783,10 @@ class ScraperService:
         now = utcnow()
         source_config = SourceRegistryService.get_source_config(source)
         db.source_checkpoints.update_one(
-            {"source": source, "query_key": query.strip().lower()},
+            {"source": source, "query_key": query.strip().lower(), "user_id": user_id},
             {
                 "$set": {
+                    "user_id": user_id,
                     "source": source,
                     "query": query,
                     "query_key": query.strip().lower(),

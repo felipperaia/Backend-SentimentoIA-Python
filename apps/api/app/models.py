@@ -339,5 +339,5 @@ class SearchResponse(BaseModel):
 
 class ScrapeRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=160)
-    sources: List[ScrapeSource] = Field(default_factory=lambda: [ScrapeSource.RECLAMEAQUI, ScrapeSource.REDDIT, ScrapeSource.MASTODON])
+    sources: List[ScrapeSource] = Field(default_factory=lambda: [ScrapeSource.RECLAMEAQUI, ScrapeSource.REDDIT, ScrapeSource.WEB])
     limit_per_source: int = Field(default=5, ge=1, le=10)
