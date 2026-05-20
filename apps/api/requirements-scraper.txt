@@ -1,5 +1,0 @@
-# Optional scraper integrations.
-# Keep these separate from core runtime so deploys are not blocked by optional collectors.
-
-google-play-scraper>=1.2,<1.3
-playwright>=1.44,<2
