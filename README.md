@@ -1,137 +1,192 @@
-# backend-api-python - SentimentoIA (FastAPI + Worker + Prompts)
+# SentimentoIA Backend (FastAPI + Worker)
 
-## Objetivo arquitetural
+Backend oficial da plataforma SentimentoIA para autenticacao, coleta de mencoes, processamento de sentimento, insights, chat restrito ao dominio e exportacoes.
 
-Este backend e a camada unica de integracao da plataforma para:
+## Sumario
 
-- IA (Ollama direto via backend)
-- scraping (Reclame Aqui, Reddit e Web)
-- insights e exportacoes (Markdown/PDF)
-- persistencia (MongoDB Atlas)
-- chat user-scoped por usuario autenticado
+- [Visao geral](#visao-geral)
+- [Stack e arquitetura](#stack-e-arquitetura)
+- [Estrutura de pastas](#estrutura-de-pastas)
+- [Pre-requisitos](#pre-requisitos)
+- [Setup local](#setup-local)
+- [Configuracao de ambiente](#configuracao-de-ambiente)
+- [Como executar](#como-executar)
+- [Documentacao da API](#documentacao-da-api)
+- [Endpoints principais](#endpoints-principais)
+- [Testes](#testes)
+- [Deploy](#deploy)
+- [Troubleshooting](#troubleshooting)
 
-Nao existe dependencia de LLM direta no frontend.
+## Visao geral
 
-Fluxo oficial:
+Fluxo principal da aplicacao:
 
-`frontend -> backend principal -> Ollama`
+`frontend -> backend -> MongoDB + Ollama + pipelines de coleta/processamento`
 
-O backend continua dono de autenticacao/autorizacao, filtros por `user_id`, prompts de dominio fechado, regras de negocio e persistencia.
+Responsabilidades deste backend:
 
-Camada de contexto controlado preparada para evolucao de ferramentas internas autorizadas:
+- autenticacao JWT e MFA
+- ingestao e scraping de dados
+- dashboard e mencoes por usuario autenticado
+- geracao e exportacao de insights (Markdown/PDF)
+- chat com contexto controlado por usuario
+- processamento assincrono via worker
 
-- `get_user_dashboard_summary`
-- `get_user_recent_mentions`
-- `get_user_open_insights`
-- `get_user_settings_safe`
+## Stack e arquitetura
 
-## Estrutura
+- API: FastAPI
+- Banco: MongoDB (Motor/PyMongo)
+- IA: Ollama (integracao direta via backend)
+- Worker: loop assincrono para processamento de fila e insights
+- Testes: pytest + TestClient
 
-- API: `apps/api/app`
-- Testes API: `apps/api/tests`
-- Worker: `apps/worker/app/worker.py`
-- Prompts de dominio: `packages/prompts`
-- Template de ambiente canonico:
-   - `apps/api/.env.example`
+## Estrutura de pastas
 
-## Configuracao do .env real (apps/api/.env)
+```text
+apps/
+   api/
+      app/                # codigo da API (entrypoint: app.main:app)
+      tests/              # testes da API
+      .env.example        # template de configuracao
+   worker/
+      app/worker.py       # processo de worker
+packages/
+   prompts/              # prompts e base de conhecimento do dominio
+```
 
-O arquivo `apps/api/.env` e a fonte canonica de configuracao para API e worker:
-
-- valores antigos relevantes foram comentados
-- valores ativos ficaram explicitos para deploy
-- variaveis existentes foram preservadas (sem remover blocos)
-
-Principais ajustes realizados:
-
-- `ENV` e `DEBUG` com perfil de producao ativo
-- `APP_URL` e `FRONTEND_URL` com formato publico
-- `CORS_ORIGINS_CSV` adicionado para controle de origens
-- `OLLAMA_BASE_URL` definido como endpoint do Ollama
-- `SCRAPER_DEFAULT_SOURCES` alinhado para `reclameaqui,reddit,web`
-- variaveis operacionais adicionadas: `WORKER_POLL_INTERVAL_SECONDS`, `WORKER_BATCH_SIZE`, `LOG_LEVEL`
-
-Observacao importante:
-
-- Segredos atuais (`SECRET_KEY`, `MONGODB_URI`, `OLLAMA_API_KEY`, SMTP) foram mantidos.
-- Nao commitar credenciais reais em repositorio publico.
-
-## Requisitos
+## Pre-requisitos
 
 - Python 3.11+
-- MongoDB Atlas
-- OLLAMA_BASE_URL valido
+- MongoDB acessivel (local ou Atlas)
+- Ollama acessivel para recursos de IA
 
-## Execucao local
+## Setup local
 
-### 1) API
+Execute os comandos na raiz do repositorio.
+
+### Windows (PowerShell)
 
 ```powershell
-cd repos-separados-20260506/backend-api-python/apps/api
-py -3.11 -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir .
+python -m pip install -r apps/api/requirements.txt
+Copy-Item apps/api/.env.example apps/api/.env
 ```
 
-### 2) Worker (terminal separado)
+### Linux/macOS
 
-```powershell
-cd repos-separados-20260506/backend-api-python
-.\apps\api\.venv\Scripts\Activate.ps1
-python -m apps.worker.app.worker
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r apps/api/requirements.txt
+cp apps/api/.env.example apps/api/.env
 ```
 
-O worker utiliza o mesmo arquivo `apps/api/.env`.
+Opcional (somente se habilitar coletores baseados em Playwright):
 
-## Variaveis obrigatorias de ambiente
+```bash
+python -m playwright install
+```
 
-### Base/API
+## Configuracao de ambiente
 
-- `ENV`
-- `DEBUG`
-- `APP_URL`
-- `FRONTEND_URL`
-- `CORS_ORIGINS_CSV`
-- `SECRET_KEY`
-- `ALGORITHM`
-- `ACCESS_TOKEN_EXPIRE_MINUTES`
+O arquivo canonico de configuracao e `apps/api/.env` (utilizado pela API e pelo worker).
 
-### MongoDB
+Variaveis essenciais:
 
-- `MONGODB_URI`
-- `DATABASE_NAME`
+- `MONGODB_URI`: conexao MongoDB
+- `DATABASE_NAME`: nome do banco
+- `SECRET_KEY`: chave JWT (obrigatorio trocar em producao)
+- `FRONTEND_URL`: URL do frontend
+- `CORS_ORIGINS_CSV`: origens CORS permitidas
 
-### IA (Ollama direto)
+Variaveis importantes para IA:
 
 - `OLLAMA_BASE_URL`
-- `OLLAMA_API_KEY` (opcional quando o endpoint nao exige auth)
+- `OLLAMA_API_KEY` (quando necessario)
 - `OLLAMA_MODEL`
 - `OLLAMA_TIMEOUT_SECONDS`
 
-### Scraping
-
-- `SCRAPER_DEFAULT_SOURCES` (recomendado: `reclameaqui,reddit,web`)
-- `SCRAPER_DEFAULT_LIMIT`
-- `SCRAPER_TIMEOUT_SECONDS`
-- `SCRAPER_RETRY_ATTEMPTS`
-- `SCRAPER_RETRY_BACKOFF_SECONDS`
-- `SCRAPER_RECLAMEAQUI_URL`
-- `SCRAPER_RECLAMEAQUI_SEARCH_URL`
-- `SCRAPER_REDDIT_URL`
-- `SCRAPER_WEB_SEARCH_URL`
-
-### Worker
+Variaveis importantes para worker:
 
 - `WORKER_POLL_INTERVAL_SECONDS`
 - `WORKER_BATCH_SIZE`
 - `LLM_TRIGGER_MIN_COMMENTS`
 - `LLM_MAX_SAMPLE_MENTIONS`
-- `LOG_LEVEL`
 
-## Contrato principal da API
+## Como executar
+
+### 1) API
+
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir apps/api --reload
+```
+
+### 2) Worker (novo terminal, na raiz)
+
+```bash
+python -m apps.worker.app.worker
+```
+
+Observacao:
+
+- o worker carrega automaticamente o mesmo `apps/api/.env`
+- entrypoint recomendado da API: `app.main:app`
+- `app.main_real:app` e legado e nao deve ser usado como padrao
+
+## Documentacao da API
+
+Com a API rodando localmente:
+
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+- Healthcheck: `http://localhost:8000/health`
+
+Autenticacao padrao dos endpoints protegidos:
+
+- `Authorization: Bearer <token_jwt>`
+
+## Endpoints principais
+
+### Autenticacao (`/api/auth`)
+
+- `POST /register`
+- `POST /login`
+- `GET /me`
+- `PATCH /me`
+- `POST /change-password`
+- `GET /mfa/status`
+- `POST /mfa/setup`
+- `POST /mfa/enable`
+- `POST /mfa/verify`
+- `POST /mfa/disable`
+
+### Ingestao (`/api/ingestion`)
+
+- `POST /comments`
+- `GET /batches`
+- `GET /batches/{batch_id}`
+
+### Busca, coleta e monitoramento
+
+- `POST /api/search`
+- `POST /api/scrape`
+- `GET /api/search/history`
+- `GET /api/dashboard`
+- `GET /api/mentions`
+- `GET /api/status/integrations`
+
+### Insights
+
+- `GET /api/insights`
+- `POST /api/insights/generate`
+- `POST /api/insights/{insight_id}/regenerate`
+- `POST /api/insights/{insight_id}/archive`
+- `DELETE /api/insights/{insight_id}`
+- `GET /api/insights/export/markdown`
+- `GET /api/insights/export/pdf`
 
 ### Chat
 
@@ -143,78 +198,67 @@ O worker utiliza o mesmo arquivo `apps/api/.env`.
 - `DELETE /api/chat/threads/{thread_id}/messages/{message_id}`
 - `DELETE /api/chat/threads`
 
-### Insights
+### Relatorios e privacidade
 
-- `GET /api/insights?priority=&resolution=&batch_id=&include_archived=&limit=`
-- `POST /api/insights/generate`
-- `POST /api/insights/{insight_id}/regenerate`
-- `POST /api/insights/{insight_id}/archive`
-- `DELETE /api/insights/{insight_id}`
-- `GET /api/insights/export/markdown?priority=&resolution=&limit=`
-- `GET /api/insights/export/pdf?priority=&resolution=&limit=`
+- `GET /api/reports/csv?search_id=...`
+- `GET /api/reports/pdf?search_id=...`
+- `GET /api/reports/export/{report_format}`
+- `GET /api/privacy/policy`
+- `POST /api/privacy/consent`
 
-### Busca/Scraping
+## Testes
 
-- `POST /api/scrape`
-- `POST /api/search`
-- `GET /api/dashboard`
-- `GET /api/mentions`
+Com ambiente virtual ativo, execute na raiz do repositorio:
 
-### Status
-
-- `GET /health`
-- `GET /api/status/integrations`
-
-Todos os dados de chat, dashboard, insights e exportacao sao filtrados por `user_id` autenticado.
-
-## Guia de testes
-
-### Unitario/integracao rapida
-
-```powershell
-cd repos-separados-20260506/backend-api-python/apps/api
-.\.venv\Scripts\python.exe -m pytest tests/test_main_flow.py tests/test_scrape.py -q
+```bash
+python -m pytest apps/api/tests -q
 ```
 
-### Suite backend completa
+Exemplo de execucao focada:
 
-```powershell
-cd repos-separados-20260506/backend-api-python/apps/api
-.\.venv\Scripts\python.exe -m pytest tests -q
+```bash
+python -m pytest apps/api/tests/test_main_flow.py apps/api/tests/test_scrape.py -q
 ```
 
-### Validacao manual minima
+Observacao:
 
-1. Registrar/login de usuario (JWT + MFA, se habilitado)
-2. Executar `/api/scrape` e `/api/search`
-3. Validar dashboard/mencoes por usuario
-4. Gerar insight e validar filtros `priority` e `resolution`
-5. Exportar insights markdown/pdf
-6. Criar thread de chat, enviar mensagem e deletar mensagem/thread
+- os testes usam, por padrao, `DATABASE_NAME=sentimento_db_pytest`
 
-## Deploy (HostingGuru ou equivalente)
+## Deploy
 
-### Start commands
+Comandos de start recomendados:
 
 - API:
-   - `uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir apps/api`
-- Worker:
-   - `python -m apps.worker.app.worker`
 
-### Checklist de producao
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir apps/api
+```
+
+- Worker:
+
+```bash
+python -m apps.worker.app.worker
+```
+
+Checklist minimo de producao:
 
 - `ENV=production`
 - `DEBUG=false`
-- `APP_URL` publico
-- `FRONTEND_URL` publico
+- `SECRET_KEY` forte e secreta
+- `MONGODB_URI` de producao
+- `FRONTEND_URL` publica
 - `CORS_ORIGINS_CSV` sem localhost
-- `MONGODB_URI` (Atlas)
-- `OLLAMA_BASE_URL` apontando para o endpoint correto
-- `OLLAMA_API_KEY` via secret manager (quando aplicavel)
+- `OLLAMA_BASE_URL` apontando para endpoint valido
 
-## Troubleshooting rapido
+## Troubleshooting
 
-- Erro de CORS: revisar `FRONTEND_URL` e `CORS_ORIGINS_CSV`
-- Timeout de IA: ajustar `OLLAMA_TIMEOUT_SECONDS`
-- Sem resultados de scraping: validar `SCRAPER_DEFAULT_SOURCES` e limites
-- Falha em exportacao: verificar autenticacao e dados por usuario
+- Erro `ModuleNotFoundError: app`:
+   - execute a API com `--app-dir apps/api`
+- Erro de CORS:
+   - valide `FRONTEND_URL` e `CORS_ORIGINS_CSV`
+- API sem recursos de IA:
+   - valide `OLLAMA_BASE_URL` e timeout de rede
+- Worker nao processa fila:
+   - confirme conexao com MongoDB e valores de `WORKER_*`
+- Falha em exportacoes:
+   - confirme autenticacao JWT e existencia de dados do usuario
