@@ -20,7 +20,7 @@ from app.config import settings
 from app.database import MongoDB, get_db
 from app.models import ScrapeRequest, SearchRequest
 from app.schemas import ChatMessageCreateRequest, ChatThreadCreateRequest, UserSettingsUpdateRequest
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, ChatUnavailableError
 from app.services.dashboard_service import DashboardService
 from app.services.enrichment_service import EnrichmentService
 from app.services.insight_service import InsightGenerationError, InsightService
@@ -131,6 +131,19 @@ def _sanitize_http_detail(status_code: int, detail: Any) -> str:
         return _default_http_error_message(status_code)
 
     return text
+
+
+def _parse_query_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return default
+
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+    return max(minimum, min(maximum, parsed))
 
 
 def _hash_ip_prefix(ip_address: str | None) -> str:
@@ -477,21 +490,32 @@ async def dashboard(
 async def mentions(
     batch_id: str | None = Query(None),
     search_id: str | None = Query(None),
+    batch_id_alias: str | None = Query(None, alias="batchId"),
+    search_id_alias: str | None = Query(None, alias="searchId"),
     status: str | None = Query(None),
     sentiment: str | None = Query(None),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: str | None = Query("100"),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     """Lista mencoes por contexto, com filtros opcionais por status e sentimento."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    selected_batch_id = batch_id or search_id
+    selected_batch_id = (
+        str(batch_id or "").strip()
+        or str(search_id or "").strip()
+        or str(batch_id_alias or "").strip()
+        or str(search_id_alias or "").strip()
+        or None
+    )
+    normalized_status = str(status or "").strip().lower() or None
+    normalized_sentiment = str(sentiment or "").strip().lower() or None
+    normalized_limit = _parse_query_int(limit, default=100, minimum=1, maximum=1000)
 
     return DashboardService.list_mentions(
         user_id=user_id,
         batch_id=selected_batch_id,
-        status=status,
-        sentiment=sentiment,
-        limit=limit,
+        status=normalized_status,
+        sentiment=normalized_sentiment,
+        limit=normalized_limit,
     )
 
 
@@ -535,6 +559,9 @@ async def generate_insight(
     except InsightGenerationError as exc:
         safe_message = str(exc.message or "Nao foi possivel gerar insight")
         details = exc.details if isinstance(exc.details, dict) else {}
+        expected_state = str(exc.code or "") == "threshold_not_met"
+        reason = str(details.get("reason") or exc.code or "insight_generation_error")
+        actionable_message = str(details.get("actionable_message") or safe_message)
         return JSONResponse(
             status_code=400,
             content={
@@ -542,7 +569,14 @@ async def generate_insight(
                 "error": safe_message,
                 "detail": safe_message,
                 "code": str(exc.code or "insight_generation_error"),
-                "expected_state": str(exc.code or "") == "threshold_not_met",
+                "reason": reason,
+                "expected_state": expected_state,
+                "business_state": {
+                    "type": "expected_business_rule" if expected_state else "error",
+                    "expected": expected_state,
+                    "reason": reason,
+                    "actionable_message": actionable_message,
+                },
                 "meta": details,
             },
         )
@@ -708,8 +742,12 @@ async def send_chat_message(
             content=payload.content,
             locale=locale,
         )
+    except ChatUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        safe_detail = str(exc)
+        status_code = 404 if "thread nao encontrada" in safe_detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=safe_detail) from exc
     return result
 
 

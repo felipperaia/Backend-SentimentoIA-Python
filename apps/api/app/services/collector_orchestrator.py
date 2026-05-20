@@ -123,7 +123,9 @@ class CollectorOrchestrator:
 
         results: dict[str, list[dict[str, Any]]] = {}
 
-        for source_name in selected_sources:
+        inter_source_delay = max(0.0, float(getattr(settings, "SCRAPER_DELAY_SECONDS", 5.0) or 0.0))
+
+        for index, source_name in enumerate(selected_sources):
             if source_name not in collectors_map:
                 self.last_errors.append(
                     {
@@ -137,7 +139,9 @@ class CollectorOrchestrator:
                 continue
 
             # Delay entre dominios diferentes para reduzir bloqueios.
-            await asyncio.sleep(random.uniform(3.0, 7.0))
+            if index > 0 and inter_source_delay > 0:
+                jitter = min(1.5, inter_source_delay * 0.3)
+                await asyncio.sleep(max(0.1, inter_source_delay + random.uniform(-jitter, jitter)))
 
             try:
                 collector = collectors_map[source_name]()
@@ -147,6 +151,22 @@ class CollectorOrchestrator:
 
                 valid_items = [item for item in items if isinstance(item, dict)]
                 results[source_name] = valid_items[:max_per_source]
+
+                collector_failure = getattr(collector, "last_failure", None)
+                if not valid_items and isinstance(collector_failure, dict):
+                    normalized_reason = str(collector_failure.get("reason") or "temporary_failure").strip().lower()
+                    timeout_flag = bool(collector_failure.get("timeout", False)) or normalized_reason == "timeout"
+                    self.last_errors.append(
+                        {
+                            "source": source_name,
+                            "error": str(
+                                collector_failure.get("error")
+                                or ("Tempo limite excedido na coleta desta fonte" if timeout_flag else "Falha temporaria na coleta desta fonte")
+                            ),
+                            "reason": normalized_reason or "temporary_failure",
+                            "timeout": timeout_flag,
+                        }
+                    )
             except Exception as exc:
                 logger.warning("Coletor %s falhou: %s", source_name, type(exc).__name__)
                 classified_error = CollectorOrchestrator._classify_source_error(exc)

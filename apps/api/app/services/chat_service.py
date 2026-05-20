@@ -75,6 +75,11 @@ IN_SCOPE_KEYWORDS = [
 ]
 
 
+
+class ChatUnavailableError(RuntimeError):
+    """Erro controlado quando a resposta de IA nao pode ser gerada no momento."""
+
+
 class ChatService:
     @staticmethod
     def _sanitize_user_content(content: str) -> str:
@@ -330,10 +335,27 @@ class ChatService:
                 {"role": "user", "content": clean_content},
             ]
 
-            assistant_content = await LLMService.answer_domain_chat(
-                messages=messages,
-                authorized_context=authorized_context,
-            )
+            try:
+                assistant_content = await LLMService.answer_domain_chat(
+                    messages=messages,
+                    authorized_context=authorized_context,
+                    fail_on_unavailable=True,
+                )
+            except RuntimeError as exc:
+                db.chat_threads.update_one(
+                    {"_id": thread_id, "user_id": user_id},
+                    {
+                        "$set": {
+                            "locale": locale,
+                            "updated_at": now,
+                            "last_message_at": now,
+                        }
+                    },
+                )
+                raise ChatUnavailableError(
+                    "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
+                ) from exc
+
             if not isinstance(assistant_content, str) or not assistant_content.strip():
                 assistant_content = ChatService._temporary_unavailable_message(locale=locale)
                 assistant_metadata = {

@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     OLLAMA_API_KEY: str = ""
     OLLAMA_MODEL: str = ""
     OLLAMA_TIMEOUT_SECONDS: int = 60
+    # Campos legados mantidos para compatibilidade de testes/integracoes antigas.
+    LLM_GATEWAY_BASE_URL: str = ""
+    LLM_GATEWAY_API_KEY: str = ""
+    LLM_GATEWAY_TIMEOUT_SECONDS: int = 60
 
     @property
     def OLLAMA_EFFECTIVE_URL(self) -> str:
@@ -44,18 +48,27 @@ class Settings(BaseSettings):
 
     @property
     def LLM_GATEWAY_EFFECTIVE_URL(self) -> str:
-        # Alias legado de compatibilidade: manter interface antiga sem usar gateway.
-        return self.OLLAMA_EFFECTIVE_URL
+        # Alias legado de compatibilidade: usa Ollama se configurado; caso contrario, usa gateway legado.
+        if self.OLLAMA_EFFECTIVE_URL:
+            return self.OLLAMA_EFFECTIVE_URL
+
+        legacy_url = str(self.LLM_GATEWAY_BASE_URL or "").strip().rstrip("/")
+        if not legacy_url:
+            return ""
+        if legacy_url.lower().endswith("/api"):
+            return legacy_url
+        return f"{legacy_url}/api"
 
     @property
     def LLM_GATEWAY_EFFECTIVE_API_KEY(self) -> str:
-        # Alias legado de compatibilidade: API key passa a ser a do Ollama.
-        return str(self.OLLAMA_API_KEY or "").strip()
+        # Alias legado de compatibilidade: API key do Ollama prevalece quando presente.
+        return str(self.OLLAMA_API_KEY or self.LLM_GATEWAY_API_KEY or "").strip()
 
     @property
     def LLM_GATEWAY_TIMEOUT_SECONDS_EFFECTIVE(self) -> int:
-        # Alias legado de compatibilidade: timeout passa a ser o do Ollama.
-        return max(1, int(self.OLLAMA_TIMEOUT_SECONDS or 60))
+        # Alias legado de compatibilidade: timeout do Ollama prevalece quando presente.
+        timeout_value = self.OLLAMA_TIMEOUT_SECONDS or self.LLM_GATEWAY_TIMEOUT_SECONDS or 60
+        return max(1, int(timeout_value))
 
     @property
     def LLM_MODEL_EFFECTIVE(self) -> str:
@@ -99,7 +112,7 @@ class Settings(BaseSettings):
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
     SCRAPER_DELAY_SECONDS: float = 5.0
-    SCRAPER_TIMEOUT_SECONDS: int = 20
+    SCRAPER_TIMEOUT_SECONDS: int = 35
     SCRAPER_DEFAULT_LIMIT: int = 5
     SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,web"
     SCRAPER_MAX_ITEMS_PER_SOURCE: int = 10

@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -29,6 +30,15 @@ class LLMService:
         base_url = str(value or "").strip().rstrip("/")
         if not base_url:
             return ""
+
+        parse_target = base_url if "://" in base_url else f"http://{base_url}"
+        parsed = urlparse(parse_target)
+        hostname = str(parsed.hostname or "").strip().lower()
+        is_localhost = hostname in {"localhost", "127.0.0.1", "::1"} or hostname.startswith("127.")
+        if settings.IS_PRODUCTION and is_localhost:
+            logger.warning("OLLAMA_BASE_URL com localhost em producao foi ignorada por seguranca")
+            return ""
+
         if base_url.lower().endswith("/api"):
             return base_url
         return f"{base_url}/api"
@@ -38,8 +48,22 @@ class LLMService:
         direct_url = (
             LLMService._settings_str("OLLAMA_EFFECTIVE_URL")
             or LLMService._settings_str("OLLAMA_BASE_URL")
+            or LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_URL")
+            or LLMService._settings_str("LLM_GATEWAY_BASE_URL")
         )
         return LLMService._normalize_api_base_url(direct_url)
+
+    @staticmethod
+    def _legacy_gateway_mode() -> bool:
+        legacy_base = (
+            LLMService._settings_str("LLM_GATEWAY_BASE_URL")
+            or LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_URL")
+        )
+        ollama_base = (
+            LLMService._settings_str("OLLAMA_BASE_URL")
+            or LLMService._settings_str("OLLAMA_EFFECTIVE_URL")
+        )
+        return bool(legacy_base and not ollama_base)
 
     @staticmethod
     def _effective_api_key() -> str:
@@ -67,7 +91,14 @@ class LLMService:
 
     @staticmethod
     def ollama_configured() -> bool:
-        return bool(LLMService._effective_base_url() and LLMService._effective_model())
+        base_url = LLMService._effective_base_url()
+        if not base_url:
+            return False
+
+        if LLMService._legacy_gateway_mode():
+            return bool(LLMService._effective_api_key())
+
+        return bool(LLMService._effective_model())
 
     @staticmethod
     def gateway_configured() -> bool:
@@ -322,18 +353,19 @@ class LLMService:
     @staticmethod
     async def call_ollama(prompt: str, format_json: bool = False) -> dict[str, Any]:
         model = LLMService._effective_model()
-        if not model:
+        if not model and not LLMService._legacy_gateway_mode():
             raise RuntimeError("OLLAMA_MODEL nao configurado")
 
         url = LLMService._build_ollama_url("generate")
         timeout = LLMService._llm_timeout_seconds()
 
         payload: dict[str, Any] = {
-            "model": model,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.2},
         }
+        if model:
+            payload["model"] = model
         if format_json:
             payload["format"] = "json"
 
@@ -345,19 +377,20 @@ class LLMService:
     @staticmethod
     async def _call_ollama(prompt: str, model: str | None = None) -> dict[str, Any]:
         selected_model = str(model or LLMService._effective_model()).strip()
-        if not selected_model:
+        if not selected_model and not LLMService._legacy_gateway_mode():
             raise RuntimeError("OLLAMA_MODEL nao configurado")
 
         url = LLMService._build_ollama_url("generate")
         timeout = LLMService._llm_timeout_seconds()
 
         payload: dict[str, Any] = {
-            "model": selected_model,
             "prompt": prompt,
             "stream": False,
             "format": "json",
             "options": {"temperature": 0.2},
         }
+        if selected_model:
+            payload["model"] = selected_model
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -368,18 +401,19 @@ class LLMService:
     @staticmethod
     async def call_ollama_chat(messages: list[dict[str, Any]]) -> str:
         model = LLMService._effective_model()
-        if not model:
+        if not model and not LLMService._legacy_gateway_mode():
             raise RuntimeError("OLLAMA_MODEL nao configurado")
 
         url = LLMService._build_ollama_url("chat")
         timeout = LLMService._llm_timeout_seconds()
 
         payload = {
-            "model": model,
             "messages": messages,
             "stream": False,
             "options": {"temperature": 0.15},
         }
+        if model:
+            payload["model"] = model
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -390,18 +424,19 @@ class LLMService:
     @staticmethod
     async def _call_ollama_text(prompt: str, model: str | None = None) -> str:
         selected_model = str(model or LLMService._effective_model()).strip()
-        if not selected_model:
+        if not selected_model and not LLMService._legacy_gateway_mode():
             raise RuntimeError("OLLAMA_MODEL nao configurado")
 
         url = LLMService._build_ollama_url("chat")
         timeout = LLMService._llm_timeout_seconds()
 
         payload = {
-            "model": selected_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {"temperature": 0.15},
         }
+        if selected_model:
+            payload["model"] = selected_model
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -472,11 +507,14 @@ class LLMService:
     async def answer_domain_chat(
         messages: list | None = None,
         authorized_context: dict | None = None,
+        fail_on_unavailable: bool = False,
         **legacy_kwargs: Any,
     ) -> str:
         fallback = "Desculpe, o assistente esta temporariamente indisponivel."
 
         if not LLMService.ollama_configured():
+            if fail_on_unavailable:
+                raise RuntimeError("Ollama nao configurado")
             return fallback
 
         try:
@@ -540,12 +578,14 @@ class LLMService:
             return response if response else fallback
         except (httpx.HTTPError, httpx.TimeoutException, RuntimeError, ValueError) as exc:
             logger.exception("Falha no chat Ollama: %s", exc)
+            if fail_on_unavailable:
+                raise RuntimeError("Ollama indisponivel") from exc
             return fallback
 
     @staticmethod
     async def health_check() -> dict[str, Any]:
         base_url = LLMService._effective_base_url()
-        configured = bool(base_url and LLMService._effective_model())
+        configured = bool(base_url and LLMService.ollama_configured())
 
         if not configured:
             return {

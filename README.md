@@ -109,9 +109,17 @@ Variaveis importantes para IA:
 - `OLLAMA_MODEL`
 - `OLLAMA_TIMEOUT_SECONDS`
 
+Variaveis importantes para coleta em ambientes lentos:
+
+- `SCRAPER_TIMEOUT_SECONDS`
+- `SCRAPER_RETRY_ATTEMPTS`
+- `SCRAPER_RETRY_BACKOFF_SECONDS`
+- `SCRAPER_DELAY_SECONDS`
+
 Observacao de deploy:
 
 - em producao, `OLLAMA_BASE_URL` deve apontar para endpoint remoto valido (sem `localhost`)
+- se `OLLAMA_BASE_URL` estiver em `localhost/127.0.0.1` com `ENV=production`, a integracao de IA e ignorada por seguranca
 
 Variaveis importantes para worker:
 
@@ -182,6 +190,13 @@ Autenticacao padrao dos endpoints protegidos:
 - `GET /api/mentions`
 - `GET /api/status/integrations`
 
+Contrato de `GET /api/mentions`:
+
+- aceita `batch_id` ou `search_id` (tambem `batchId`/`searchId` por compatibilidade)
+- filtros opcionais: `status`, `sentiment`
+- `limit` e normalizado no backend para faixa segura (`1..1000`) para evitar falhas de validacao por formato
+- retorno atual: lista de mencoes serializadas
+
 Contrato de status para busca/coleta:
 
 - `POST /api/search` e `POST /api/scrape` retornam `status` (`success|partial_success|empty|failed`)
@@ -197,6 +212,12 @@ Contrato de status para busca/coleta:
 - `GET /api/insights/export/markdown`
 - `GET /api/insights/export/pdf`
 
+Contrato de erro esperado em `POST /api/insights/generate`:
+
+- quando limiar minimo nao e atingido, retorna `400` com `code=threshold_not_met`
+- a resposta inclui `expected_state=true`, `reason`, `business_state` e `meta.actionable_message`
+- esse caso deve ser tratado como estado de negocio esperado no frontend
+
 ### Chat
 
 - `GET /api/chat/threads`
@@ -206,6 +227,11 @@ Contrato de status para busca/coleta:
 - `DELETE /api/chat/threads/{thread_id}`
 - `DELETE /api/chat/threads/{thread_id}/messages/{message_id}`
 - `DELETE /api/chat/threads`
+
+Comportamento de indisponibilidade da IA:
+
+- quando Ollama estiver indisponivel, o envio de mensagem retorna `503` com detalhe sanitizado
+- a mensagem do usuario continua persistida no historico para manter consistencia de thread
 
 ### Relatorios e privacidade
 

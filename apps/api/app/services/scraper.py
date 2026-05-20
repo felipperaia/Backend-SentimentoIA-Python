@@ -210,12 +210,23 @@ class BaseCollector:
     source_name = "unknown"
     source_tier = "B"
 
+    def __init__(self) -> None:
+        self.last_failure: dict[str, Any] | None = None
+
     @property
     def source(self) -> str:
         return self.source_name
 
     async def collect(self, query: str, limit: int) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+    def _set_failure(self, *, reason: str, error: str, timeout: bool) -> None:
+        self.last_failure = {
+            "source": self.source,
+            "reason": str(reason or "temporary_failure"),
+            "error": str(error or "Falha temporaria na coleta desta fonte"),
+            "timeout": bool(timeout),
+        }
 
     def _random_headers(self) -> dict[str, str]:
         user_agent = random.choice(USER_AGENTS)
@@ -323,9 +334,13 @@ class BaseCollector:
         expect_json: bool = False,
     ) -> Any:
         timeout = max(5, int(getattr(settings, "SCRAPER_TIMEOUT_SECONDS", 20) or 20))
+        retry_attempts = max(1, int(getattr(settings, "SCRAPER_RETRY_ATTEMPTS", 3) or 3))
+        retry_backoff = max(0.1, float(getattr(settings, "SCRAPER_RETRY_BACKOFF_SECONDS", 1.0) or 1.0))
+        self.last_failure = None
 
-        for attempt in range(3):
-            await asyncio.sleep(random.uniform(2.0, 5.0))
+        for attempt in range(retry_attempts):
+            # Pequeno jitter para reduzir bloqueios sem inflar demais o tempo total.
+            await asyncio.sleep(random.uniform(0.2, 0.8))
             request_headers = self._random_headers()
             if headers:
                 request_headers.update(headers)
@@ -340,37 +355,78 @@ class BaseCollector:
                         headers=request_headers,
                     )
             except Exception as exc:
-                logger.warning("%s request falhou (%s) tentativa %s/3", self.source, exc, attempt + 1)
-                if attempt < 2:
-                    await asyncio.sleep((2**attempt) * random.uniform(0.5, 1.5))
+                lowered_exc = str(exc or "").lower()
+                is_timeout = isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)) or (
+                    "timeout" in lowered_exc or "timed out" in lowered_exc
+                )
+                self._set_failure(
+                    reason="timeout" if is_timeout else "temporary_failure",
+                    error="Tempo limite excedido na coleta desta fonte" if is_timeout else "Falha temporaria na coleta desta fonte",
+                    timeout=is_timeout,
+                )
+                logger.warning(
+                    "%s request falhou (%s) tentativa %s/%s",
+                    self.source,
+                    type(exc).__name__,
+                    attempt + 1,
+                    retry_attempts,
+                )
+                if attempt < retry_attempts - 1:
+                    backoff_delay = retry_backoff * (2**attempt) + random.uniform(0.0, retry_backoff)
+                    await asyncio.sleep(backoff_delay)
                 continue
 
             status = int(response.status_code)
             if status in {403, 429}:
                 logger.warning("%s recebeu HTTP %s em %s", self.source, status, url)
-                if attempt < 2:
-                    await asyncio.sleep(random.uniform(15.0, 30.0))
+                self._set_failure(
+                    reason="rate_limited" if status == 429 else "source_unavailable",
+                    error="Limite temporario da fonte atingido" if status == 429 else "Fonte indisponivel no momento",
+                    timeout=False,
+                )
+                if attempt < retry_attempts - 1:
+                    backoff_delay = retry_backoff * (2**attempt) + random.uniform(0.0, retry_backoff)
+                    await asyncio.sleep(backoff_delay)
                     continue
                 return None
 
             if 500 <= status < 600:
                 logger.warning("%s recebeu HTTP %s em %s", self.source, status, url)
-                if attempt < 2:
-                    await asyncio.sleep((2**attempt) * random.uniform(0.5, 1.5))
+                self._set_failure(
+                    reason="temporary_failure",
+                    error="Falha temporaria na coleta desta fonte",
+                    timeout=False,
+                )
+                if attempt < retry_attempts - 1:
+                    backoff_delay = retry_backoff * (2**attempt) + random.uniform(0.0, retry_backoff)
+                    await asyncio.sleep(backoff_delay)
                     continue
                 return None
 
             if status >= 400:
                 logger.warning("%s recebeu HTTP %s em %s", self.source, status, url)
+                self._set_failure(
+                    reason="source_unavailable",
+                    error="Fonte indisponivel no momento",
+                    timeout=False,
+                )
                 return None
 
             if not expect_json:
+                self.last_failure = None
                 return response.text
 
             try:
-                return response.json()
+                payload = response.json()
+                self.last_failure = None
+                return payload
             except ValueError:
                 logger.warning("%s recebeu JSON invalido em %s", self.source, url)
+                self._set_failure(
+                    reason="temporary_failure",
+                    error="Falha temporaria na resposta da fonte",
+                    timeout=False,
+                )
                 return None
 
         return None
