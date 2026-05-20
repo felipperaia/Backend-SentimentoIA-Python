@@ -54,22 +54,126 @@ class SearchService:
         return text[:220]
 
     @staticmethod
-    def _sanitize_error_entry(entry: Any) -> dict[str, str]:
+    def _sanitize_error_entry(entry: Any) -> dict[str, Any]:
         if isinstance(entry, dict):
             source = str(entry.get("source") or "unknown").strip().lower() or "unknown"
             message = SearchService._normalize_error_message(entry.get("error") or entry.get("detail") or "")
-            return {"source": source, "error": message}
+            reason = str(entry.get("reason") or "").strip().lower()
+            timeout = bool(entry.get("timeout", False)) or reason == "timeout"
+
+            if timeout:
+                message = "Tempo limite excedido na coleta"
+            if not reason:
+                if timeout:
+                    reason = "timeout"
+                elif "limite" in message.lower():
+                    reason = "rate_limited"
+                else:
+                    reason = "temporary_failure"
+
+            return {
+                "source": source,
+                "error": message,
+                "reason": reason,
+                "timeout": timeout,
+            }
 
         return {
             "source": "unknown",
             "error": SearchService._normalize_error_message(entry),
+            "reason": "temporary_failure",
+            "timeout": False,
         }
 
     @staticmethod
-    def _sanitize_errors(errors: Any) -> list[dict[str, str]]:
+    def _sanitize_errors(errors: Any) -> list[dict[str, Any]]:
         if not isinstance(errors, list):
             return []
         return [SearchService._sanitize_error_entry(item) for item in errors]
+
+    @staticmethod
+    def _build_status_summary(
+        *,
+        requested_sources: list[str],
+        mentions: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        normalized_requested: list[str] = []
+        for source in requested_sources:
+            normalized = str(source or "").strip().lower()
+            if normalized and normalized not in normalized_requested:
+                normalized_requested.append(normalized)
+
+        mention_counts: dict[str, int] = {}
+        for mention in mentions:
+            source = str(mention.get("source") or "").strip().lower()
+            if not source:
+                continue
+            mention_counts[source] = mention_counts.get(source, 0) + 1
+
+        errors_by_source: dict[str, list[dict[str, Any]]] = {}
+        timeout_sources: set[str] = set()
+        unmapped_error_count = 0
+        for error in errors:
+            source = str(error.get("source") or "unknown").strip().lower() or "unknown"
+            if source in {"unknown", "system"}:
+                unmapped_error_count += 1
+                continue
+
+            errors_by_source.setdefault(source, []).append(error)
+            if bool(error.get("timeout", False)) or str(error.get("reason") or "") == "timeout":
+                timeout_sources.add(source)
+
+        if not normalized_requested:
+            normalized_requested = sorted(set(mention_counts.keys()) | set(errors_by_source.keys()))
+
+        source_status: list[dict[str, Any]] = []
+        for source in normalized_requested:
+            source_errors = errors_by_source.get(source, [])
+            source_mentions = int(mention_counts.get(source, 0))
+            first_error = source_errors[0] if source_errors else {}
+            source_status.append(
+                {
+                    "source": source,
+                    "ok": source_mentions > 0,
+                    "count": source_mentions,
+                    "error": first_error.get("error") if first_error else None,
+                    "reason": first_error.get("reason") if first_error else None,
+                    "timeout": any(bool(item.get("timeout", False)) for item in source_errors),
+                }
+            )
+
+        sources_with_data = sum(1 for item in source_status if int(item.get("count", 0)) > 0)
+        sources_failed = sum(1 for item in source_status if item.get("error")) + unmapped_error_count
+        partial_success = sources_with_data > 0 and sources_failed > 0
+
+        if partial_success:
+            status = "partial_success"
+            message = "Coleta concluida com falhas parciais em algumas fontes."
+        elif sources_with_data == 0 and sources_failed > 0:
+            status = "failed"
+            message = "Coleta sem resultados devido a falhas nas fontes selecionadas."
+        elif sources_with_data == 0:
+            status = "empty"
+            message = "Coleta concluida sem novos resultados."
+        else:
+            status = "success"
+            message = "Coleta concluida com sucesso."
+
+        if timeout_sources and status in {"partial_success", "failed"}:
+            message = f"{message} Uma ou mais fontes atingiram tempo limite."
+
+        return {
+            "status": status,
+            "partial_success": partial_success,
+            "message": message,
+            "sources_requested": len(normalized_requested),
+            "sources_with_data": sources_with_data,
+            "sources_failed": sources_failed,
+            "timeout_sources": sorted(timeout_sources),
+            "source_status": source_status,
+            "unmapped_error_count": unmapped_error_count,
+        }
 
     @staticmethod
     async def run_search(
@@ -106,6 +210,13 @@ class SearchService:
             if cached:
                 mentions = list(db.mentions.find({"search_id": cached["search_id"]}, {"raw": 0}).sort("published_at", -1))
                 sanitized_errors = SearchService._sanitize_errors(cached.get("errors", []))
+                status_summary = cached.get("status_summary")
+                if not isinstance(status_summary, dict):
+                    status_summary = SearchService._build_status_summary(
+                        requested_sources=sources,
+                        mentions=mentions,
+                        errors=sanitized_errors,
+                    )
                 return {
                     "search_id": cached["search_id"],
                     "query": query,
@@ -116,6 +227,9 @@ class SearchService:
                     "llm_analysis": cached.get("llm_analysis", {}),
                     "alerts": [],
                     "errors": sanitized_errors,
+                    "status": status_summary.get("status", "success"),
+                    "partial_success": bool(status_summary.get("partial_success", False)),
+                    "status_summary": status_summary,
                 }
 
         search_id = make_search_id()
@@ -187,6 +301,12 @@ class SearchService:
         if alerts:
             db.alerts.insert_many(alerts)
 
+        status_summary = SearchService._build_status_summary(
+            requested_sources=sources,
+            mentions=enriched_mentions,
+            errors=errors,
+        )
+
         db.search_jobs.update_one(
             {"search_id": search_id},
             {
@@ -197,6 +317,7 @@ class SearchService:
                     "metrics": metrics,
                     "llm_analysis": llm_analysis,
                     "errors": errors,
+                    "status_summary": status_summary,
                 }
             },
         )
@@ -211,6 +332,9 @@ class SearchService:
             "llm_analysis": llm_analysis,
             "alerts": SearchService.serialize_many(alerts),
             "errors": errors,
+            "status": status_summary.get("status", "success"),
+            "partial_success": bool(status_summary.get("partial_success", False)),
+            "status_summary": status_summary,
         }
 
     @staticmethod

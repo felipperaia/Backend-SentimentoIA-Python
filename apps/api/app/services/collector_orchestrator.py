@@ -32,12 +32,51 @@ class CollectorOrchestrator:
             for source in (active_sources or [])
             if str(source or "").strip()
         ]
-        self.last_errors: list[dict[str, str]] = []
+        self.last_errors: list[dict[str, Any]] = []
 
     @staticmethod
-    def _public_source_error(source_name: str) -> str:
-        del source_name
-        return "Falha temporaria na coleta desta fonte"
+    def _classify_source_error(exc: Exception) -> dict[str, Any]:
+        raw_message = str(exc or "").strip()
+        lowered = raw_message.lower()
+        exc_name = type(exc).__name__.lower()
+
+        timeout_markers = (
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+            "read timed out",
+            "connect timeout",
+            "cancelled",
+            "cancellederror",
+        )
+        if isinstance(exc, asyncio.TimeoutError) or any(marker in lowered or marker in exc_name for marker in timeout_markers):
+            return {
+                "error": "Tempo limite excedido na coleta desta fonte",
+                "reason": "timeout",
+                "timeout": True,
+            }
+
+        rate_limit_markers = ("429", "rate limit", "too many requests", "limite")
+        if any(marker in lowered for marker in rate_limit_markers):
+            return {
+                "error": "Limite temporario da fonte atingido",
+                "reason": "rate_limited",
+                "timeout": False,
+            }
+
+        unavailable_markers = ("403", "forbidden", "captcha", "blocked", "denied")
+        if any(marker in lowered for marker in unavailable_markers):
+            return {
+                "error": "Fonte indisponivel no momento",
+                "reason": "source_unavailable",
+                "timeout": False,
+            }
+
+        return {
+            "error": "Falha temporaria na coleta desta fonte",
+            "reason": "temporary_failure",
+            "timeout": False,
+        }
 
     @staticmethod
     def _collectors_map() -> dict[str, type[BaseCollector]]:
@@ -90,6 +129,8 @@ class CollectorOrchestrator:
                     {
                         "source": source_name,
                         "error": "Fonte indisponivel no coletor atual",
+                        "reason": "unsupported_source",
+                        "timeout": False,
                     }
                 )
                 results[source_name] = []
@@ -108,10 +149,13 @@ class CollectorOrchestrator:
                 results[source_name] = valid_items[:max_per_source]
             except Exception as exc:
                 logger.warning("Coletor %s falhou: %s", source_name, type(exc).__name__)
+                classified_error = CollectorOrchestrator._classify_source_error(exc)
                 self.last_errors.append(
                     {
                         "source": source_name,
-                        "error": CollectorOrchestrator._public_source_error(source_name),
+                        "error": str(classified_error.get("error") or "Falha temporaria na coleta desta fonte"),
+                        "reason": str(classified_error.get("reason") or "temporary_failure"),
+                        "timeout": bool(classified_error.get("timeout", False)),
                     }
                 )
                 results[source_name] = []

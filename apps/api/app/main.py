@@ -23,7 +23,7 @@ from app.schemas import ChatMessageCreateRequest, ChatThreadCreateRequest, UserS
 from app.services.chat_service import ChatService
 from app.services.dashboard_service import DashboardService
 from app.services.enrichment_service import EnrichmentService
-from app.services.insight_service import InsightService
+from app.services.insight_service import InsightGenerationError, InsightService
 from app.services.llm_service import LLMService
 from app.services.normalization_service import normalize_mention, utcnow
 from app.services.nps_service import NpsService
@@ -210,10 +210,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+effective_cors_origins = list(settings.CORS_ORIGINS_EFFECTIVE or [])
+if settings.IS_PRODUCTION and not effective_cors_origins:
+    logger.warning(
+        "Nenhuma origem CORS valida para producao. Defina FRONTEND_URL e/ou CORS_ORIGINS_CSV para evitar bloqueios."
+    )
+
+allow_origins = effective_cors_origins or ([] if settings.IS_PRODUCTION else ["*"])
+allow_credentials = bool(allow_origins and allow_origins != ["*"])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS_EFFECTIVE or ["*"],
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -434,12 +443,15 @@ async def scrape_mentions(payload: ScrapeRequest, current_user: dict[str, Any] =
     """Executa scraping simples por fonte e retorna resultados agrupados."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     sources = [getattr(source, "value", str(source)) for source in payload.sources]
-    return await ScraperService.scrape_async(
-        query=payload.query,
-        sources=sources,
-        limit_per_source=payload.limit_per_source,
-        user_id=user_id,
-    )
+    try:
+        return await ScraperService.scrape_async(
+            query=payload.query,
+            sources=sources,
+            limit_per_source=payload.limit_per_source,
+            user_id=user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/dashboard")
@@ -467,7 +479,7 @@ async def mentions(
     search_id: str | None = Query(None),
     status: str | None = Query(None),
     sentiment: str | None = Query(None),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=1000),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     """Lista mencoes por contexto, com filtros opcionais por status e sentimento."""
@@ -520,6 +532,20 @@ async def generate_insight(
             force=payload.force,
         )
         return {"ok": True, "item": generated}
+    except InsightGenerationError as exc:
+        safe_message = str(exc.message or "Nao foi possivel gerar insight")
+        details = exc.details if isinstance(exc.details, dict) else {}
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": safe_message,
+                "detail": safe_message,
+                "code": str(exc.code or "insight_generation_error"),
+                "expected_state": str(exc.code or "") == "threshold_not_met",
+                "meta": details,
+            },
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

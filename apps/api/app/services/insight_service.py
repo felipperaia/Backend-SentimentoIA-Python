@@ -22,6 +22,14 @@ ALLOWED_RESOLUTIONS = {"pending", "in_progress", "resolved"}
 ALLOWED_STATUSES = {"open", "in_progress", "resolved"}
 
 
+class InsightGenerationError(ValueError):
+    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = str(code or "insight_generation_error")
+        self.message = str(message or "Nao foi possivel gerar insight")
+        self.details = details or {}
+
+
 class InsightService:
     @staticmethod
     def _default_dashboard_settings(user_id: str) -> dict[str, Any]:
@@ -866,7 +874,54 @@ class InsightService:
 
         if not enqueue_result.get("queued") and not force:
             reason = enqueue_result.get("reason", "nao_enfileirado")
-            raise ValueError(f"Nao foi possivel enfileirar insight: {reason}")
+            details: dict[str, Any] = {
+                "reason": reason,
+                "context_id": context_id,
+                "context_type": context_type,
+            }
+
+            if reason == "threshold_not_met":
+                threshold = int(enqueue_result.get("threshold") or InsightService.get_threshold(user_id=user_id))
+                processed_count = int(enqueue_result.get("processed_count") or 0)
+                missing_count = max(0, threshold - processed_count)
+                details.update(
+                    {
+                        "threshold": threshold,
+                        "processed_count": processed_count,
+                        "missing_count": missing_count,
+                        "actionable_message": (
+                            f"Sao necessarias pelo menos {threshold} mencoes processadas para gerar insight. "
+                            f"Atualmente existem {processed_count}."
+                        ),
+                    }
+                )
+                raise InsightGenerationError(
+                    code="threshold_not_met",
+                    message="Ainda nao ha mencoes suficientes para gerar insight.",
+                    details=details,
+                )
+
+            if reason == "active_job_exists":
+                details["job_id"] = enqueue_result.get("job_id")
+                raise InsightGenerationError(
+                    code="active_job_exists",
+                    message="Ja existe uma geracao de insight em andamento para este contexto.",
+                    details=details,
+                )
+
+            if reason == "active_insight_exists":
+                details["insight_id"] = enqueue_result.get("insight_id")
+                raise InsightGenerationError(
+                    code="active_insight_exists",
+                    message="Ja existe um insight ativo para este contexto. Use regenerar para atualizar.",
+                    details=details,
+                )
+
+            raise InsightGenerationError(
+                code="enqueue_failed",
+                message="Nao foi possivel enfileirar insight no momento.",
+                details=details,
+            )
 
         await InsightService.process_queued_jobs(limit=1)
 

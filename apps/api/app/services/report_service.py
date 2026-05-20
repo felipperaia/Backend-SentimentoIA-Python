@@ -198,7 +198,7 @@ class ReportService:
         return Response(
             content=pdf,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="relatorio-executivo-{search_id}.pdf"'},
+            headers={"Content-Disposition": f'attachment; filename="relatorio-{search_id}.pdf"'},
         )
 
     @staticmethod

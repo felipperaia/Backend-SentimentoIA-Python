@@ -109,6 +109,10 @@ Variaveis importantes para IA:
 - `OLLAMA_MODEL`
 - `OLLAMA_TIMEOUT_SECONDS`
 
+Observacao de deploy:
+
+- em producao, `OLLAMA_BASE_URL` deve apontar para endpoint remoto valido (sem `localhost`)
+
 Variaveis importantes para worker:
 
 - `WORKER_POLL_INTERVAL_SECONDS`
@@ -177,6 +181,11 @@ Autenticacao padrao dos endpoints protegidos:
 - `GET /api/dashboard`
 - `GET /api/mentions`
 - `GET /api/status/integrations`
+
+Contrato de status para busca/coleta:
+
+- `POST /api/search` e `POST /api/scrape` retornam `status` (`success|partial_success|empty|failed`)
+- ambos retornam `status_summary` com falhas por fonte, incluindo `reason` e `timeout`
 
 ### Insights
 
@@ -260,7 +269,7 @@ Checklist minimo de producao:
 - `MONGODB_URI` de producao
 - `FRONTEND_URL` publica
 - `CORS_ORIGINS_CSV` sem localhost
-- `OLLAMA_BASE_URL` apontando para endpoint valido
+- `OLLAMA_BASE_URL` apontando para endpoint remoto valido (sem localhost)
 
 ## Troubleshooting
 

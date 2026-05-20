@@ -11,8 +11,24 @@ class CollectorService:
     """Converte itens do ScraperService em menções normalizadas para o pipeline."""
 
     @staticmethod
-    def _public_source_error(raw_error: Any) -> str:
+    def _public_source_error(
+        raw_error: Any,
+        *,
+        reason: str | None = None,
+        timeout: bool | None = None,
+    ) -> str:
         text = str(raw_error or "").strip().lower()
+        normalized_reason = str(reason or "").strip().lower()
+
+        if timeout is True or normalized_reason == "timeout":
+            return "Tempo limite excedido na coleta desta fonte"
+        if normalized_reason == "rate_limited":
+            return "Limite temporario da fonte atingido"
+        if normalized_reason == "unsupported_source":
+            return "Fonte nao suportada no backend atual"
+        if normalized_reason == "source_unavailable":
+            return "Fonte indisponivel no momento"
+
         if not text:
             return "Falha temporaria na coleta da fonte"
         if "timeout" in text or "timed out" in text:
@@ -20,8 +36,35 @@ class CollectorService:
         if "limit" in text or "429" in text:
             return "Limite temporario da fonte atingido"
         if "nao suportada" in text or "indisponivel" in text:
-            return str(raw_error)
+            if "nao suportada" in text:
+                return "Fonte nao suportada no backend atual"
+            return "Fonte indisponivel no momento"
         return "Falha temporaria na coleta da fonte"
+
+    @staticmethod
+    def _normalize_source_error_entry(source_error: Any) -> dict[str, Any]:
+        if isinstance(source_error, dict):
+            source_name = str(source_error.get("source") or "unknown")
+            reason = str(source_error.get("reason") or "").strip().lower() or None
+            timeout_flag = bool(source_error.get("timeout", False)) or reason == "timeout"
+            public_error = CollectorService._public_source_error(
+                source_error.get("error") or "",
+                reason=reason,
+                timeout=timeout_flag,
+            )
+            return {
+                "source": source_name,
+                "error": public_error,
+                "reason": reason or "temporary_failure",
+                "timeout": timeout_flag,
+            }
+
+        return {
+            "source": "unknown",
+            "error": CollectorService._public_source_error(source_error),
+            "reason": "temporary_failure",
+            "timeout": False,
+        }
 
     @staticmethod
     async def collect(
@@ -45,7 +88,14 @@ class CollectorService:
         except Exception as exc:
             logger.exception("Falha geral na coleta por scraping")
             del exc
-            return [], [{"source": "system", "error": "Falha temporaria no processamento de coleta"}]
+            return [], [
+                {
+                    "source": "system",
+                    "error": "Falha temporaria no processamento de coleta",
+                    "reason": "collector_unavailable",
+                    "timeout": False,
+                }
+            ]
 
         for source, source_items in (scraped.get("results") or {}).items():
             for item in source_items:
@@ -71,14 +121,6 @@ class CollectorService:
                     mentions.append(normalized)
 
         for source_error in scraped.get("errors") or []:
-            if isinstance(source_error, dict):
-                errors.append(
-                    {
-                        "source": str(source_error.get("source") or "unknown"),
-                        "error": CollectorService._public_source_error(source_error.get("error") or ""),
-                    }
-                )
-            else:
-                errors.append({"source": "unknown", "error": CollectorService._public_source_error(source_error)})
+            errors.append(CollectorService._normalize_source_error_entry(source_error))
 
         return mentions, errors
