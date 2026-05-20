@@ -18,7 +18,7 @@ app = FastAPI(title="SentimentoIA API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.CORS_ORIGINS_EFFECTIVE,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
