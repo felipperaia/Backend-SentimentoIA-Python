@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     OLLAMA_API_KEY: str = ""
     OLLAMA_MODEL: str = "llama3.1:8b"
     OLLAMA_TIMEOUT_SECONDS: int = 60
+    LLM_GATEWAY_BASE_URL: str = ""
+    LLM_GATEWAY_API_KEY: str = ""
+    LLM_GATEWAY_TIMEOUT_SECONDS: int = 60
 
     @property
     def OLLAMA_EFFECTIVE_URL(self) -> str:
@@ -42,6 +45,23 @@ class Settings(BaseSettings):
         if url.lower().endswith("/api"):
             return url
         return f"{url}/api"
+
+    @property
+    def LLM_GATEWAY_EFFECTIVE_URL(self) -> str:
+        url = str(self.LLM_GATEWAY_BASE_URL or "").strip().rstrip("/")
+        if not url:
+            return ""
+        if url.lower().endswith("/api"):
+            return url
+        return f"{url}/api"
+
+    @property
+    def LLM_GATEWAY_EFFECTIVE_API_KEY(self) -> str:
+        return str(self.LLM_GATEWAY_API_KEY or "").strip()
+
+    @property
+    def LLM_GATEWAY_TIMEOUT_SECONDS_EFFECTIVE(self) -> int:
+        return max(1, int(self.LLM_GATEWAY_TIMEOUT_SECONDS or self.OLLAMA_TIMEOUT_SECONDS or 60))
 
     # URL publica do frontend para links transacionais.
     FRONTEND_URL: str = "http://localhost:5173"

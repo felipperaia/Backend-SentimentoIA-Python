@@ -20,8 +20,57 @@ class LLMService:
     )
 
     @staticmethod
+    def _settings_str(name: str) -> str:
+        value = getattr(settings, name, "")
+        return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _normalize_api_base_url(value: str) -> str:
+        base_url = str(value or "").strip().rstrip("/")
+        if not base_url:
+            return ""
+        if base_url.lower().endswith("/api"):
+            return base_url
+        return f"{base_url}/api"
+
+    @staticmethod
+    def _effective_base_url() -> str:
+        legacy_gateway_url = LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_URL")
+        if legacy_gateway_url:
+            return LLMService._normalize_api_base_url(legacy_gateway_url)
+
+        legacy_gateway_base_url = LLMService._settings_str("LLM_GATEWAY_BASE_URL")
+        if legacy_gateway_base_url:
+            return LLMService._normalize_api_base_url(legacy_gateway_base_url)
+
+        direct_url = LLMService._settings_str("OLLAMA_EFFECTIVE_URL")
+        if direct_url:
+            return LLMService._normalize_api_base_url(direct_url)
+
+        return ""
+
+    @staticmethod
+    def _effective_api_key() -> str:
+        return (
+            LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_API_KEY")
+            or LLMService._settings_str("LLM_GATEWAY_API_KEY")
+            or LLMService._settings_str("OLLAMA_API_KEY")
+        )
+
+    @staticmethod
+    def _gateway_base_url() -> str:
+        return LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_URL") or LLMService._settings_str("LLM_GATEWAY_BASE_URL")
+
+    @staticmethod
+    def _gateway_mode() -> bool:
+        return bool(LLMService._gateway_base_url())
+
+    @staticmethod
     def ollama_configured() -> bool:
-        return bool(settings.OLLAMA_EFFECTIVE_URL)
+        base_url = LLMService._effective_base_url()
+        if LLMService._gateway_mode():
+            return bool(base_url and LLMService._effective_api_key())
+        return bool(base_url)
 
     @staticmethod
     def gateway_configured() -> bool:
@@ -31,7 +80,7 @@ class LLMService:
     @staticmethod
     def _ollama_headers() -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        api_key = str(settings.OLLAMA_API_KEY or "").strip()
+        api_key = LLMService._effective_api_key()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
@@ -42,8 +91,19 @@ class LLMService:
         return LLMService._ollama_headers()
 
     @staticmethod
+    def _llm_timeout_seconds() -> int:
+        if LLMService._gateway_mode():
+            value = getattr(settings, "LLM_GATEWAY_TIMEOUT_SECONDS_EFFECTIVE", None)
+            if isinstance(value, int):
+                return max(1, value)
+            legacy_value = getattr(settings, "LLM_GATEWAY_TIMEOUT_SECONDS", None)
+            if isinstance(legacy_value, int):
+                return max(1, legacy_value)
+        return max(1, int(settings.OLLAMA_TIMEOUT_SECONDS or 60))
+
+    @staticmethod
     def _build_ollama_url(endpoint: str) -> str:
-        base_url = settings.OLLAMA_EFFECTIVE_URL.rstrip("/")
+        base_url = LLMService._effective_base_url()
         if not base_url:
             raise RuntimeError("OLLAMA_BASE_URL nao configurada")
         return f"{base_url}/{endpoint.lstrip('/')}"
@@ -246,16 +306,42 @@ class LLMService:
         return value
 
     @staticmethod
+    def _redact_text(value: Any) -> str:
+        text = str(value or "")
+        text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", LLMService.REDACTED, text)
+        text = re.sub(r"\+?\d[\d\s().-]{7,}\d", LLMService.REDACTED, text)
+        text = re.sub(r"eyJ[\w.-]{20,}", LLMService.REDACTED, text)
+        return text
+
+    @staticmethod
+    def _redact_for_prompt(value: Any, parent_key: str = "", _depth: int = 0) -> Any:
+        if _depth > 5:
+            return LLMService.REDACTED
+        if LLMService._is_sensitive_key(parent_key):
+            return LLMService.REDACTED
+        if isinstance(value, dict):
+            return {
+                str(key): LLMService._redact_for_prompt(item, str(key), _depth + 1)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [LLMService._redact_for_prompt(item, parent_key, _depth + 1) for item in value[:50]]
+        if isinstance(value, str):
+            return LLMService._redact_text(value)
+        return value
+
+    @staticmethod
     async def call_ollama(prompt: str, format_json: bool = False) -> dict[str, Any]:
         url = LLMService._build_ollama_url("generate")
-        timeout = max(1, int(settings.OLLAMA_TIMEOUT_SECONDS or 60))
+        timeout = LLMService._llm_timeout_seconds()
 
         payload: dict[str, Any] = {
-            "model": settings.OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.2},
         }
+        if not LLMService._gateway_mode():
+            payload["model"] = settings.OLLAMA_MODEL
         if format_json:
             payload["format"] = "json"
 
@@ -268,15 +354,16 @@ class LLMService:
     async def _call_ollama(prompt: str, model: str | None = None) -> dict[str, Any]:
         # Compatibilidade com testes/fluxos antigos.
         url = LLMService._build_ollama_url("generate")
-        timeout = max(1, int(settings.OLLAMA_TIMEOUT_SECONDS or 60))
+        timeout = LLMService._llm_timeout_seconds()
 
         payload: dict[str, Any] = {
-            "model": str(model or settings.OLLAMA_MODEL),
             "prompt": prompt,
             "stream": False,
             "format": "json",
             "options": {"temperature": 0.2},
         }
+        if not LLMService._gateway_mode():
+            payload["model"] = str(model or settings.OLLAMA_MODEL)
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -287,14 +374,15 @@ class LLMService:
     @staticmethod
     async def call_ollama_chat(messages: list[dict[str, Any]]) -> str:
         url = LLMService._build_ollama_url("chat")
-        timeout = max(1, int(settings.OLLAMA_TIMEOUT_SECONDS or 60))
+        timeout = LLMService._llm_timeout_seconds()
 
         payload = {
-            "model": settings.OLLAMA_MODEL,
             "messages": messages,
             "stream": False,
             "options": {"temperature": 0.15},
         }
+        if not LLMService._gateway_mode():
+            payload["model"] = settings.OLLAMA_MODEL
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -306,14 +394,15 @@ class LLMService:
     async def _call_ollama_text(prompt: str, model: str | None = None) -> str:
         # Compatibilidade com chamadas antigas.
         url = LLMService._build_ollama_url("chat")
-        timeout = max(1, int(settings.OLLAMA_TIMEOUT_SECONDS or 60))
+        timeout = LLMService._llm_timeout_seconds()
 
         payload = {
-            "model": str(model or settings.OLLAMA_MODEL),
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {"temperature": 0.15},
         }
+        if not LLMService._gateway_mode():
+            payload["model"] = str(model or settings.OLLAMA_MODEL)
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -380,11 +469,39 @@ class LLMService:
         return await LLMService.analyze_snapshot(snapshot=snapshot)
 
     @staticmethod
-    async def answer_domain_chat(messages: list, authorized_context: dict) -> str:
+    async def answer_domain_chat(
+        messages: list | None = None,
+        authorized_context: dict | None = None,
+        **legacy_kwargs: Any,
+    ) -> str:
         fallback = "Desculpe, o assistente está temporariamente indisponível."
 
         if not LLMService.ollama_configured():
             return fallback
+
+        if legacy_kwargs:
+            safe_context = LLMService._redact_for_prompt(authorized_context or {})
+            safe_history = LLMService._redact_for_prompt(legacy_kwargs.get("history") or [])
+            user_message = LLMService._redact_text(legacy_kwargs.get("user_message") or "")
+            rendered_prompt = "\n\n".join(
+                [
+                    str(legacy_kwargs.get("system_prompt") or "Sistema SentimentoIA"),
+                    f"Locale: {legacy_kwargs.get('locale') or 'pt-BR'}",
+                    f"Base de conhecimento:\n{LLMService._redact_text(legacy_kwargs.get('knowledge_base') or '')}",
+                    "Intencoes permitidas: get_user_dashboard_summary, list_mentions, generate_insight, explain_dashboard",
+                    "Contexto autorizado:\n"
+                    f"{json.dumps(safe_context, ensure_ascii=False, default=str)}",
+                    "Historico:\n"
+                    f"{json.dumps(safe_history, ensure_ascii=False, default=str)}",
+                    f"Mensagem do usuario:\n{user_message}",
+                ]
+            )
+            try:
+                response = await LLMService._call_ollama_text(rendered_prompt, model=settings.OLLAMA_MODEL)
+                return response if response else fallback
+            except (httpx.HTTPError, httpx.TimeoutException, RuntimeError, ValueError) as exc:
+                logger.exception("Falha no chat LLM legado: %s", exc)
+                return fallback
 
         safe_context = LLMService.sanitize_context(authorized_context or {})
         system_context_message = {
@@ -419,13 +536,16 @@ class LLMService:
 
     @staticmethod
     async def health_check() -> dict[str, Any]:
-        base_url = settings.OLLAMA_EFFECTIVE_URL.rstrip("/")
+        base_url = LLMService._effective_base_url()
+        provider = "llm-gateway" if LLMService._gateway_mode() else "ollama-direct"
 
         if not LLMService.ollama_configured():
             return {
                 "status": "error",
-                "provider": "ollama-direct",
+                "provider": provider,
                 "url": base_url,
+                "gateway_configured": False,
+                "gateway_ok": False,
             }
 
         tags_url = f"{base_url}/tags"
@@ -435,21 +555,27 @@ class LLMService:
                 if resp.status_code < 400:
                     return {
                         "status": "ok",
-                        "provider": "ollama-direct",
+                        "provider": provider,
                         "url": base_url,
+                        "gateway_configured": True,
+                        "gateway_ok": True,
                     }
                 return {
                     "status": "error",
-                    "provider": "ollama-direct",
+                    "provider": provider,
                     "url": base_url,
                     "detail": f"HTTP {resp.status_code}",
+                    "gateway_configured": True,
+                    "gateway_ok": False,
                 }
         except (httpx.HTTPError, httpx.TimeoutException, RuntimeError) as exc:
             return {
                 "status": "error",
-                "provider": "ollama-direct",
+                "provider": provider,
                 "url": base_url,
                 "detail": str(exc),
+                "gateway_configured": True,
+                "gateway_ok": False,
             }
 
     @staticmethod
@@ -459,7 +585,7 @@ class LLMService:
 
     @staticmethod
     async def validate_connection() -> None:
-        base_url = settings.OLLAMA_EFFECTIVE_URL.rstrip("/")
+        base_url = LLMService._effective_base_url()
         if not base_url:
             logger.warning("OLLAMA_BASE_URL nao configurada.")
             return

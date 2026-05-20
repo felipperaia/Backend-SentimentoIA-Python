@@ -530,25 +530,130 @@ class AppStoreCollector(BaseCollector):
             return []
 
         try:
-            raw_items = await asyncio.to_thread(self._collect_sync, term, limit)
+            app_id = _clean_text(getattr(settings, "COMPANY_APP_STORE_ID", ""))
+            app_name = term
+
+            if not app_id:
+                lookup_payload = await self._request(
+                    "GET",
+                    "https://itunes.apple.com/search",
+                    params={"term": term, "country": "br", "entity": "software", "limit": 1},
+                    expect_json=True,
+                )
+                app_id, app_name = self._extract_app_lookup(lookup_payload, default_name=term)
+
+            raw_items: list[dict[str, Any]] = []
+            if app_id:
+                reviews_payload = await self._request(
+                    "GET",
+                    f"https://itunes.apple.com/br/rss/customerreviews/id={app_id}/sortBy=mostRecent/json",
+                    expect_json=True,
+                )
+                raw_items = self._parse_reviews_payload(
+                    reviews_payload,
+                    app_id=app_id,
+                    app_name=app_name or term,
+                )
+
+            if not raw_items:
+                raw_items = await asyncio.to_thread(self._collect_with_legacy_library, term, limit, app_id)
+
             return self._normalize_many(raw_items, term, limit)
         except Exception as exc:
             logger.warning("AppStoreCollector falhou: %s", exc)
             return []
 
-    def _collect_sync(self, query: str, limit: int) -> list[dict[str, Any]]:
+    @staticmethod
+    def _itunes_label(value: Any) -> str:
+        if isinstance(value, dict):
+            return _clean_text(value.get("label") or value.get("#text") or value.get("value"))
+        return _clean_text(value)
+
+    @classmethod
+    def _extract_app_lookup(cls, payload: Any, default_name: str) -> tuple[str, str]:
+        if not isinstance(payload, dict):
+            return "", default_name
+
+        results = payload.get("results") or []
+        if not isinstance(results, list) or not results:
+            return "", default_name
+
+        app = results[0] or {}
+        app_id = _clean_text(app.get("trackId"))
+        app_name = _clean_text(app.get("trackName") or app.get("sellerName")) or default_name
+        return app_id, app_name
+
+    @classmethod
+    def _entry_link(cls, entry: dict[str, Any], fallback_url: str) -> str:
+        links = entry.get("link") or []
+        if isinstance(links, dict):
+            links = [links]
+
+        if isinstance(links, list):
+            for link in links:
+                attrs = (link or {}).get("attributes") or {}
+                href = _clean_text(attrs.get("href"))
+                if href:
+                    return href
+
+        return fallback_url
+
+    @classmethod
+    def _parse_reviews_payload(cls, payload: Any, *, app_id: str, app_name: str) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        feed = payload.get("feed") or {}
+        entries = feed.get("entry") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, list):
+            return []
+
+        fallback_url = f"https://apps.apple.com/br/app/id{app_id}"
+        raw_items: list[dict[str, Any]] = []
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            rating = cls._itunes_label(entry.get("im:rating"))
+            content = cls._itunes_label(entry.get("content"))
+            if not content or not rating:
+                continue
+
+            author = entry.get("author") or {}
+            raw_items.append(
+                {
+                    "title": cls._itunes_label(entry.get("title")) or f"Review App Store - {app_name}",
+                    "text": content,
+                    "snippet": content,
+                    "url": cls._entry_link(entry, fallback_url),
+                    "author": cls._itunes_label((author or {}).get("name")),
+                    "created_at": cls._itunes_label(entry.get("updated")) or utcnow(),
+                    "metadata": {
+                        "rating": rating,
+                        "version": cls._itunes_label(entry.get("im:version")),
+                        "app_id": app_id,
+                        "app_name": app_name,
+                    },
+                }
+            )
+
+        return raw_items
+
+    def _collect_with_legacy_library(self, query: str, limit: int, app_id: str | None = None) -> list[dict[str, Any]]:
         try:
             from app_store_scraper import AppStore
         except Exception:
-            logger.warning("Dependencia app-store-scraper indisponivel")
             return []
 
-        app_id = _clean_text(getattr(settings, "COMPANY_APP_STORE_ID", "")) or None
+        configured_app_id = _clean_text(app_id or getattr(settings, "COMPANY_APP_STORE_ID", "")) or None
 
         try:
-            if app_id:
+            if configured_app_id:
                 try:
-                    app = AppStore(country="br", app_name=query, app_id=app_id)
+                    app = AppStore(country="br", app_name=query, app_id=configured_app_id)
                 except TypeError:
                     app = AppStore(country="br", app_name=query)
             else:
@@ -576,7 +681,12 @@ class AppStoreCollector(BaseCollector):
                     "url": _clean_text(review.get("reviewUrl") or review.get("url") or fallback_url),
                     "author": _clean_text(review.get("userName")),
                     "created_at": review.get("date") or utcnow(),
-                    "metadata": {"rating": review.get("rating"), "id": review.get("id")},
+                    "metadata": {
+                        "rating": review.get("rating"),
+                        "id": review.get("id"),
+                        "app_id": configured_app_id,
+                        "app_name": query,
+                    },
                 }
             )
 
@@ -607,13 +717,16 @@ class PlayStoreCollector(BaseCollector):
             return []
 
         app_id = _clean_text(getattr(settings, "COMPANY_PLAY_STORE_ID", ""))
+        app_name = query
 
         try:
             if not app_id:
                 hits = search(query, lang="pt", country="br", n_hits=3)
                 if not hits:
                     return []
-                app_id = _clean_text((hits[0] or {}).get("appId"))
+                first_hit = hits[0] or {}
+                app_id = _clean_text(first_hit.get("appId"))
+                app_name = _clean_text(first_hit.get("title")) or query
 
             if not app_id:
                 return []
@@ -642,13 +755,18 @@ class PlayStoreCollector(BaseCollector):
 
             raw_items.append(
                 {
-                    "title": _clean_text(f"Review Google Play - {app_id}"),
+                    "title": _clean_text(f"Review Google Play - {app_name}"),
                     "text": content,
                     "snippet": content,
                     "url": review_url,
                     "author": _clean_text(review.get("userName")),
                     "created_at": review.get("at") or utcnow(),
-                    "metadata": {"score": review.get("score"), "thumbs_up": review.get("thumbsUpCount")},
+                    "metadata": {
+                        "score": review.get("score"),
+                        "thumbs_up": review.get("thumbsUpCount"),
+                        "app_id": app_id,
+                        "app_name": app_name,
+                    },
                 }
             )
 

@@ -1,0 +1,7 @@
+# Local development and test dependencies.
+
+-r requirements.txt
+-r requirements-scraper.txt
+
+pytest>=8,<10
+mongomock>=4.3,<5
