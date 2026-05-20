@@ -1,5 +1,5 @@
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -90,24 +90,53 @@ class NpsService:
         return SearchService.serialize(doc)
 
     @staticmethod
-    def should_show_nps(user_id: str | None, session_id: str) -> bool:
-        """Verifica se deve mostrar NPS respeitando cooldown."""
+    def should_show_nps(user_id: str | None, session_id: str) -> dict[str, Any]:
+        """Verifica se deve mostrar NPS com trigger de decisão."""
+        result: dict[str, Any] = {"should_show": False, "trigger": None}
+
         if not settings.NPS_ENABLED:
-            return False
+            return result
 
         db = get_db()
         if db is None:
-            return False
+            return result
 
-        cooldown_cutoff = utcnow() - timedelta(days=max(1, settings.NPS_COOLDOWN_DAYS))
-        query: dict[str, Any] = {"created_at": {"$gte": cooldown_cutoff}}
+        session_query: dict[str, Any] = {"session_id": session_id}
         if user_id:
-            query["user_id"] = user_id
-        else:
-            query["session_id"] = session_id
+            session_query["user_id"] = user_id
+        if db.nps_responses.find_one(session_query):
+            return result
 
-        recent = db.nps_responses.find_one(query)
-        return recent is None
+        recent_search_cutoff = utcnow() - timedelta(hours=24)
+        search_query: dict[str, Any] = {
+            "status": "completed",
+            "$or": [
+                {"updated_at": {"$gte": recent_search_cutoff}},
+                {"created_at": {"$gte": recent_search_cutoff}},
+            ],
+        }
+        if user_id:
+            search_query["user_id"] = user_id
+
+        search_doc = db.search_jobs.find_one(search_query, sort=[("updated_at", -1), ("created_at", -1)])
+        if not search_doc:
+            return result
+
+        history_query: dict[str, Any] = {"user_id": user_id} if user_id else {"session_id": session_id}
+        last_response = db.nps_responses.find_one(history_query, sort=[("created_at", -1)])
+        if not last_response:
+            return {"should_show": True, "trigger": "first_use"}
+
+        cooldown_cutoff = utcnow() - timedelta(days=max(1, int(settings.NPS_COOLDOWN_DAYS or 7)))
+        last_created_at = last_response.get("created_at")
+        if isinstance(last_created_at, datetime) and last_created_at > cooldown_cutoff:
+            return result
+
+        search_timestamp = search_doc.get("updated_at") or search_doc.get("created_at")
+        if isinstance(last_created_at, datetime) and isinstance(search_timestamp, datetime) and search_timestamp > last_created_at:
+            return {"should_show": True, "trigger": "post_search"}
+
+        return {"should_show": True, "trigger": "cooldown_elapsed"}
 
     @staticmethod
     def get_metrics(

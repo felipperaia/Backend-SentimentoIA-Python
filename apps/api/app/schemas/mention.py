@@ -26,6 +26,11 @@ class AspectType(str, Enum):
 class MentionSource(str, Enum):
     RECLAMEAQUI = "reclameaqui"
     REDDIT = "reddit"
+    YOUTUBE = "youtube"
+    APPSTORE = "appstore"
+    PLAYSTORE = "playstore"
+    GLASSDOOR = "glassdoor"
+    TRUSTPILOT = "trustpilot"
     MASTODON = "mastodon"
     WEB = "web"
 
@@ -35,7 +40,6 @@ class MentionSource(str, Enum):
     TWITTER = "twitter"
 
     # Canais opcionais
-    TRUSTPILOT = "trustpilot"
     YELP = "yelp"
     TRIPADVISOR = "tripadvisor"
     INSTAGRAM = "instagram"

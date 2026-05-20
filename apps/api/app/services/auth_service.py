@@ -29,7 +29,8 @@ class AuthService:
     @staticmethod
     def hash_password(password: str) -> str:
         """Criptografa uma senha usando bcrypt"""
-        salt = bcrypt.gensalt(rounds=12)
+        rounds = max(12, int(getattr(settings, "BCRYPT_ROUNDS", 12) or 12))
+        salt = bcrypt.gensalt(rounds=rounds)
         return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
     
     @staticmethod
@@ -70,6 +71,21 @@ class AuthService:
             candidate = f"{base[:20]}{suffix}"
 
         return candidate
+
+    @staticmethod
+    def _hash_ip_prefix(ip_address: str | None) -> str:
+        if not ip_address:
+            return hashlib.sha256(b"unknown").hexdigest()
+
+        value = str(ip_address).strip()
+        if "." in value:
+            parts = value.split(".")
+            prefix = ".".join(parts[:3])
+        else:
+            parts = value.split(":")
+            prefix = ":".join(parts[:3])
+
+        return hashlib.sha256(prefix.encode("utf-8")).hexdigest()
     
     @staticmethod
     def create_user(user_data: UserCreate) -> dict:
@@ -426,17 +442,24 @@ class AuthService:
         return True
     
     @staticmethod
-    def log_audit(user_id: str, action: str, details: dict = None, ip_address: str = None):
-        """Registra uma ação de auditoria"""
+    def log_audit(
+        user_id: str,
+        action: str,
+        details: dict = None,
+        ip_address: str = None,
+        user_agent: str = None,
+    ):
+        """Registra uma ação de auditoria sem dados sensíveis."""
+        del details
         db = get_db()
-        
+
         audit_log = {
-            "user_id": user_id,
-            "action": action,
-            "details": details or {},
-            "ip_address": ip_address,
+            "user_id": str(user_id),
+            "action": str(action),
+            "ip_hash": AuthService._hash_ip_prefix(ip_address),
             "timestamp": AuthService.utcnow(),
+            "user_agent": str(user_agent or "")[:300] or None,
         }
-        
+
         db.audit_logs.insert_one(audit_log)
         logger.info("✓ Auditoria registrada: %s para usuário: %s", action, user_id)

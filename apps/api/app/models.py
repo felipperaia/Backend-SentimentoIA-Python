@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 from enum import Enum
 
 
@@ -24,6 +24,11 @@ class CriticalityLevel(str, Enum):
 class DataSource(str, Enum):
     RECLAMEAQUI = "reclameaqui"
     REDDIT = "reddit"
+    YOUTUBE = "youtube"
+    APPSTORE = "appstore"
+    PLAYSTORE = "playstore"
+    GLASSDOOR = "glassdoor"
+    TRUSTPILOT = "trustpilot"
     MASTODON = "mastodon"
     WEB = "web"
 
@@ -33,7 +38,6 @@ class DataSource(str, Enum):
     TWITTER = "twitter"
 
     # Compatibilidade adicional
-    TRUSTPILOT = "trustpilot"
     YELP = "yelp"
     TRIPADVISOR = "tripadvisor"
     INSTAGRAM = "instagram"
@@ -42,10 +46,17 @@ class DataSource(str, Enum):
 
 class ScrapeSource(str, Enum):
     RECLAMEAQUI = "reclameaqui"
-    GOOGLE = "google"
     REDDIT = "reddit"
-    MASTODON = "mastodon"
+    YOUTUBE = "youtube"
+    APPSTORE = "appstore"
+    PLAYSTORE = "playstore"
+    GLASSDOOR = "glassdoor"
+    TRUSTPILOT = "trustpilot"
     WEB = "web"
+
+    # Legado/compatibilidade
+    GOOGLE = "google"
+    MASTODON = "mastodon"
     X = "x"
     TWITTER = "twitter"
 
@@ -320,13 +331,28 @@ class MFAVerifyRequest(BaseModel):
 # ==================== SEARCH MODELS ====================
 
 class SearchRequest(BaseModel):
-    brand_name: str
-    sources: List[DataSource]
+    brand_name: Optional[str] = None
+    query: Optional[str] = None
+    sources: List[DataSource] = Field(default_factory=lambda: [DataSource.REDDIT, DataSource.WEB])
+    limit: int = Field(default=5, ge=1, le=50)
     period_days: int = 30
     sentiment_filter: Optional[SentimentType] = None
     locality: Optional[str] = None
     min_criticality: Optional[CriticalityLevel] = None
     replace_existing: bool = True
+
+    @model_validator(mode="after")
+    def normalize_query_alias(self) -> "SearchRequest":
+        if not self.brand_name and self.query:
+            self.brand_name = self.query.strip()
+
+        if self.brand_name:
+            self.brand_name = self.brand_name.strip()
+
+        if not self.brand_name:
+            raise ValueError("brand_name ou query e obrigatorio")
+
+        return self
 
 
 class SearchResponse(BaseModel):
@@ -341,3 +367,10 @@ class ScrapeRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=160)
     sources: List[ScrapeSource] = Field(default_factory=lambda: [ScrapeSource.RECLAMEAQUI, ScrapeSource.REDDIT, ScrapeSource.WEB])
     limit_per_source: int = Field(default=5, ge=1, le=10)
+    limit: Optional[int] = Field(default=None, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def normalize_limit_alias(self) -> "ScrapeRequest":
+        if self.limit is not None:
+            self.limit_per_source = int(self.limit)
+        return self

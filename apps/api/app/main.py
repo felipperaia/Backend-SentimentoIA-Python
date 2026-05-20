@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 
 from app.api.auth_router import router as auth_router
 from app.api.ingestion_router import router as ingestion_router
+from app.api.mentions_router import router as mentions_router
+from app.api.reports_router import router as reports_router
 from app.auth_utils import get_current_user
 from app.config import settings
 from app.database import MongoDB, get_db
@@ -56,6 +59,34 @@ class NpsDismissRequest(BaseModel):
     session_id: str
     module_key: str = "geral"
     route: str | None = None
+
+
+class PrivacyConsentRequest(BaseModel):
+    session_id: str
+    analytics: bool
+    marketing: bool
+
+
+def _hash_ip_prefix(ip_address: str | None) -> str:
+    if not ip_address:
+        return hashlib.sha256(b"unknown").hexdigest()
+
+    value = str(ip_address).strip()
+    if "." in value:
+        parts = value.split(".")
+        prefix = ".".join(parts[:3])
+    else:
+        parts = value.split(":")
+        prefix = ":".join(parts[:3])
+
+    return hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+
+
+def _hash_user_agent(user_agent: str | None) -> str:
+    value = str(user_agent or "").strip()
+    if not value:
+        return hashlib.sha256(b"unknown-agent").hexdigest()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 async def auto_refresh_loop() -> None:
@@ -108,7 +139,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SentimentoIA API",
-    description="Backend com scraping (Reclame Aqui, Reddit e Web aberto), Ollama Cloud e MongoDB.",
+    description="Backend com coleta multi-fonte resiliente (Reddit, YouTube, App/Play Store e compatibilidade legada), Ollama Cloud e MongoDB.",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -120,6 +151,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
 
 app.include_router(auth_router, prefix="/api/auth", tags=["Autenticação"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
@@ -150,6 +192,51 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def health():
     """Healthcheck simples para saber se o backend está ativo."""
     return {"ok": True, "service": "SentimentoIA API", "version": "2.0.0"}
+
+
+@app.get("/api/privacy/policy")
+async def privacy_policy():
+    return {
+        "version": "1.0",
+        "effective_date": "2024-01-01",
+        "lgpd_compliant": True,
+        "data_controller": "SentimentoIA",
+        "data_subject_rights": ["acesso", "retificação", "exclusão", "portabilidade", "revogação"],
+        "retention_policy": (
+            "Dados mantidos até exclusão pelo usuário ou "
+            f"{max(1, int(settings.DATA_RETENTION_YEARS))} anos de inatividade."
+        ),
+        "contact": settings.PRIVACY_CONTACT_EMAIL or "privacidade@sentimentoia.com",
+    }
+
+
+@app.post("/api/privacy/consent")
+async def privacy_consent(
+    payload: PrivacyConsentRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Banco de dados indisponivel")
+
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    ip_hash = _hash_ip_prefix(request.client.host if request.client else None)
+    user_agent_hash = _hash_user_agent(request.headers.get("user-agent"))
+
+    consent_doc = {
+        "userid": user_id,
+        "user_id": user_id,
+        "session_id": payload.session_id,
+        "analytics": bool(payload.analytics),
+        "marketing": bool(payload.marketing),
+        "ip_hash": ip_hash,
+        "created_at": utcnow(),
+        "user_agent_hash": user_agent_hash,
+    }
+    db.user_consents.insert_one(consent_doc)
+
+    return {"ok": True}
 
 
 @app.get("/api/status/integrations")
@@ -206,8 +293,7 @@ async def scrape_mentions(payload: ScrapeRequest, current_user: dict[str, Any] =
     """Executa scraping simples por fonte e retorna resultados agrupados."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     sources = [getattr(source, "value", str(source)) for source in payload.sources]
-    return await asyncio.to_thread(
-        ScraperService.scrape,
+    return await ScraperService.scrape_async(
         query=payload.query,
         sources=sources,
         limit_per_source=payload.limit_per_source,
@@ -688,7 +774,11 @@ async def delete_all_insights(current_user: dict[str, Any] = Depends(get_current
     return {"ok": True}
 
 @app.delete("/api/user/data/all")
-async def delete_all_user_data(current_user: dict[str, Any] = Depends(get_current_user)):
+@app.delete("/api/user-data/all")
+async def delete_all_user_data(
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
     user_id = str(current_user.get("_id") or current_user.get("id"))
     db = get_db()
     collections = [
@@ -699,6 +789,16 @@ async def delete_all_user_data(current_user: dict[str, Any] = Depends(get_curren
     for coll in collections:
         db[coll].delete_many({"user_id": user_id})
     db.dashboard_settings.delete_many({"user_id": user_id})
+
+    db.audit_logs.insert_one(
+        {
+            "user_id": user_id,
+            "action": "data_deletion_request",
+            "timestamp": utcnow(),
+            "ip_hash": _hash_ip_prefix(request.client.host if request.client else None),
+        }
+    )
+
     return {"ok": True, "message": "Todos os dados do usuário foram apagados com sucesso"}
 
 
@@ -749,7 +849,7 @@ async def nps_check(
 ):
     """Verifica se deve mostrar NPS ao usuario."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    return {"should_show": NpsService.should_show_nps(user_id=user_id, session_id=session_id)}
+    return NpsService.should_show_nps(user_id=user_id, session_id=session_id)
 
 
 @app.get("/api/nps/metrics")
@@ -760,3 +860,8 @@ async def nps_metrics(
 ):
     """Retorna metricas NPS agregadas."""
     return NpsService.get_metrics(period_days=period_days, module_key=module_key)
+
+
+# Routers adicionais registrados sem expor admin_router.
+app.include_router(mentions_router, prefix="/api/mentions")
+app.include_router(reports_router, prefix="/api/reports-admin")

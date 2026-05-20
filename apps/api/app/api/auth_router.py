@@ -78,6 +78,7 @@ def serialize_user(user: dict) -> UserResponse:
         role=user.get("role", "user"),
         mfa_enabled=user.get("mfa_enabled", False),
         mfa_verified=user.get("mfa_verified", False),
+        data_rights_url="/api/privacy/policy",
         created_at=user.get("created_at"),
         updated_at=user.get("updated_at"),
         last_signed_in=user.get("last_signed_in"),

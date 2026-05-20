@@ -1,13 +1,14 @@
 """Testes de validacao para as correcoes criticas do SentimentoIA."""
+import asyncio
+
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
-import json
+from unittest.mock import patch, MagicMock
 
 
 # ====================== P1: Ollama Cloud ======================
 
 class TestOllamaURLConstruction:
-    """Verifica que a URL final do Ollama nao duplica /api."""
+    """Verifica compatibilidade da montagem de URL do gateway."""
 
     def test_base_url_with_trailing_api(self):
         """OLLAMA_BASE_URL=https://ollama.com/api → EFFECTIVE_URL=https://ollama.com"""
@@ -33,82 +34,62 @@ class TestOllamaURLConstruction:
         """Verifica que _build_ollama_url monta /api/generate corretamente."""
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.OLLAMA_EFFECTIVE_URL = "https://ollama.com"
+            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local"
             url = LLMService._build_ollama_url("generate")
-            assert url == "https://ollama.com/api/generate"
+            assert url == "https://gateway.local/api/generate"
             assert "/api/api/" not in url
 
     def test_build_ollama_url_no_double_slash(self):
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.OLLAMA_EFFECTIVE_URL = "https://ollama.com/"
+            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local/"
             url = LLMService._build_ollama_url("generate")
             assert "//api" not in url
 
     def test_ollama_configured_requires_key(self):
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.OLLAMA_EFFECTIVE_URL = "https://ollama.com"
-            mock_settings.OLLAMA_MODEL = "llama3.1:8b"
-            mock_settings.OLLAMA_API_KEY = ""
+            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local"
+            mock_settings.LLM_MODEL_EFFECTIVE = "llama3.1:8b"
+            mock_settings.LLM_GATEWAY_EFFECTIVE_API_KEY = ""
             assert LLMService.ollama_configured() is False
 
     def test_ollama_configured_with_key(self):
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.OLLAMA_EFFECTIVE_URL = "https://ollama.com"
-            mock_settings.OLLAMA_MODEL = "llama3.1:8b"
-            mock_settings.OLLAMA_API_KEY = "test-key-123"
+            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local"
+            mock_settings.LLM_MODEL_EFFECTIVE = "llama3.1:8b"
+            mock_settings.LLM_GATEWAY_EFFECTIVE_API_KEY = "test-key-123"
             assert LLMService.ollama_configured() is True
 
 
 # ====================== P2: Scraper ======================
 
-class TestRedditScraper:
-    """Verifica melhorias no scraper do Reddit."""
+class TestCollectorsResilience:
+    """Verifica comportamento resiliente dos novos coletores."""
 
-    def test_build_reddit_queries_creates_variations(self):
-        from app.services.scraper_service import ScraperService
-        queries = ScraperService._build_reddit_queries("Nubank")
-        assert len(queries) >= 2
-        assert '"Nubank"' in queries[0]
+    def test_reddit_public_json_sem_oauth(self):
+        from app.services.scraper import RedditCollector
 
-    def test_reddit_relevance_exact_match(self):
-        from app.services.scraper_service import ScraperService
-        score = ScraperService._reddit_relevance("Nubank", "Problema com Nubank", "Meu cartão Nubank")
-        assert score == 1.0
+        async def fake_request(*args, **kwargs):
+            del args, kwargs
+            await asyncio.sleep(0)
+            return {"data": {"children": []}}
 
-    def test_reddit_relevance_no_match(self):
-        from app.services.scraper_service import ScraperService
-        score = ScraperService._reddit_relevance("Nubank", "Receita de bolo", "Como fazer pão")
-        assert score < 0.2
+        with patch.object(RedditCollector, "_request", side_effect=fake_request):
+            items = asyncio.run(RedditCollector().collect("Nubank", 5))
+            assert items == []
 
+    def test_reclameaqui_disabled_returns_empty(self):
+        from app.services.scraper import ReclameAquiCollector
 
-class TestMastodonScraper:
-    """Verifica graceful degradation do Mastodon."""
+        with patch("app.services.scraper.settings") as mock_settings:
+            mock_settings.ENABLE_RECLAME_AQUI = False
+            mock_settings.ENABLE_RECLAMEAQUI = False
+            mock_settings.APIFY_TOKEN = ""
 
-    def test_mastodon_without_token_degrades(self):
-        """Sem token, deve retornar erro descritivo sem quebrar."""
-        from app.services.scraper_service import ScraperService
-        with patch("app.services.scraper_service.settings") as mock_settings:
-            mock_settings.SCRAPER_MASTODON_BASE_URL = "https://mastodon.social"
-            mock_settings.SCRAPER_MASTODON_SEARCH_PATH = "/api/v2/search"
-            mock_settings.SCRAPER_MASTODON_ACCESS_TOKEN = ""
-            mock_settings.SCRAPER_TIMEOUT_SECONDS = 10
-            mock_settings.SCRAPER_RETRY_ATTEMPTS = 1
-            mock_settings.SCRAPER_DELAY_SECONDS = 0.1
-            mock_settings.SCRAPER_RETRY_BACKOFF_SECONDS = 0.1
-            mock_settings.SCRAPER_USER_AGENT = "test"
-
-            with patch.object(ScraperService, "_request") as mock_request:
-                mock_resp = MagicMock()
-                mock_resp.json.return_value = {"accounts": [], "hashtags": [], "statuses": []}
-                mock_request.return_value = mock_resp
-
-                items, error = ScraperService._scrape_mastodon("test", 5)
-                assert items == []
-                assert error is not None
-                assert "modo publico" in error.lower() or "mastodon" in error.lower()
+            items = asyncio.run(ReclameAquiCollector().collect("Nubank", 5))
+            assert items == []
 
 
 # ====================== P3: Pipeline ======================

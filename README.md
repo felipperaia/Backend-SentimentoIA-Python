@@ -4,7 +4,7 @@
 
 Este backend e a camada unica de integracao da plataforma para:
 
-- IA (Ollama Cloud via backend)
+- IA (Ollama direto via backend)
 - scraping (Reclame Aqui, Reddit e Web)
 - insights e exportacoes (Markdown/PDF)
 - persistencia (MongoDB Atlas)
@@ -12,20 +12,31 @@ Este backend e a camada unica de integracao da plataforma para:
 
 Nao existe dependencia de LLM direta no frontend.
 
+Fluxo oficial:
+
+`frontend -> backend principal -> Ollama`
+
+O backend continua dono de autenticacao/autorizacao, filtros por `user_id`, prompts de dominio fechado, regras de negocio e persistencia.
+
+Camada de contexto controlado preparada para evolucao de ferramentas internas autorizadas:
+
+- `get_user_dashboard_summary`
+- `get_user_recent_mentions`
+- `get_user_open_insights`
+- `get_user_settings_safe`
+
 ## Estrutura
 
 - API: `apps/api/app`
 - Testes API: `apps/api/tests`
 - Worker: `apps/worker/app/worker.py`
 - Prompts de dominio: `packages/prompts`
-- Env examples:
+- Template de ambiente canonico:
    - `apps/api/.env.example`
-   - `apps/worker/.env.example`
-   - `.env.example`
 
-## Atualizacao do .env real (apps/api/.env)
+## Configuracao do .env real (apps/api/.env)
 
-O arquivo `apps/api/.env` foi atualizado no mesmo padrao aplicado no frontend:
+O arquivo `apps/api/.env` e a fonte canonica de configuracao para API e worker:
 
 - valores antigos relevantes foram comentados
 - valores ativos ficaram explicitos para deploy
@@ -36,7 +47,7 @@ Principais ajustes realizados:
 - `ENV` e `DEBUG` com perfil de producao ativo
 - `APP_URL` e `FRONTEND_URL` com formato publico
 - `CORS_ORIGINS_CSV` adicionado para controle de origens
-- `OLLAMA_BASE_URL` atualizado para `https://ollama.com/api` com valor anterior comentado
+- `OLLAMA_BASE_URL` definido como endpoint do Ollama
 - `SCRAPER_DEFAULT_SOURCES` alinhado para `reclameaqui,reddit,web`
 - variaveis operacionais adicionadas: `WORKER_POLL_INTERVAL_SECONDS`, `WORKER_BATCH_SIZE`, `LOG_LEVEL`
 
@@ -49,7 +60,7 @@ Observacao importante:
 
 - Python 3.11+
 - MongoDB Atlas
-- OLLAMA_API_KEY valido
+- OLLAMA_BASE_URL valido
 
 ## Execucao local
 
@@ -73,7 +84,7 @@ cd repos-separados-20260506/backend-api-python
 python -m apps.worker.app.worker
 ```
 
-O worker utiliza `apps/worker/.env` e `apps/api/.env`.
+O worker utiliza o mesmo arquivo `apps/api/.env`.
 
 ## Variaveis obrigatorias de ambiente
 
@@ -93,11 +104,10 @@ O worker utiliza `apps/worker/.env` e `apps/api/.env`.
 - `MONGODB_URI`
 - `DATABASE_NAME`
 
-### IA (Ollama)
+### IA (Ollama direto)
 
-- `LLM_PROVIDER=ollama`
-- `OLLAMA_BASE_URL` (default recomendado: `https://ollama.com/api`)
-- `OLLAMA_API_KEY`
+- `OLLAMA_BASE_URL`
+- `OLLAMA_API_KEY` (opcional quando o endpoint nao exige auth)
 - `OLLAMA_MODEL`
 - `OLLAMA_TIMEOUT_SECONDS`
 
@@ -199,8 +209,8 @@ cd repos-separados-20260506/backend-api-python/apps/api
 - `FRONTEND_URL` publico
 - `CORS_ORIGINS_CSV` sem localhost
 - `MONGODB_URI` (Atlas)
-- `OLLAMA_BASE_URL=https://ollama.com/api`
-- `OLLAMA_API_KEY` via secret manager
+- `OLLAMA_BASE_URL` apontando para o endpoint correto
+- `OLLAMA_API_KEY` via secret manager (quando aplicavel)
 
 ## Troubleshooting rapido
 

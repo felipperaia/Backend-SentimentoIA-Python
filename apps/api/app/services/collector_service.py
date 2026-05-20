@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from typing import Any
 
@@ -25,8 +24,7 @@ class CollectorService:
         errors: list[dict[str, Any]] = []
 
         try:
-            scraped = await asyncio.to_thread(
-                ScraperService.scrape,
+            scraped = await ScraperService.scrape_async(
                 query=term,
                 sources=sources,
                 user_id=user_id,
@@ -55,6 +53,7 @@ class CollectorService:
                     raw=item,
                 )
                 if normalized:
+                    normalized["source_tier"] = str(item.get("source_tier") or "B")
                     mentions.append(normalized)
 
         for source_error in scraped.get("errors") or []:

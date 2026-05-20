@@ -1,64 +1,39 @@
+import json
 from pathlib import Path
 from typing import Any
-from unicodedata import category, normalize
 from uuid import uuid4
 import re
 
 from app.database import get_db
-from app.services.dashboard_service import DashboardService
-from app.services.insight_service import InsightService
+from app.services.controlled_context_service import build_authorized_context
 from app.services.llm_service import LLMService
 from app.services.normalization_service import utcnow
 from app.services.search_service import SearchService
 
 PROMPTS_DIR = Path(__file__).resolve().parents[4] / "packages" / "prompts"
-SYSTEM_PROMPT_FILE = "domain-closed-system-prompt.md"
-KNOWLEDGE_FILE = "domain-knowledge-base.md"
 DB_UNAVAILABLE_ERROR = "Banco de dados indisponivel"
 DEFAULT_THREAD_TITLE = "Nova conversa"
-
-DOMAIN_KEYWORDS = {
-    "sentimentoia",
-    "dashboard",
-    "insight",
-    "insights",
-    "kpi",
-    "kpis",
-    "mencao",
-    "mencoes",
-    "reputacao",
-    "ingestao",
-    "busca",
-    "search",
-    "settings",
-    "configuracao",
-    "configuracoes",
-    "tema",
-    "idioma",
-    "locale",
-    "llm",
-    "limiar",
-    "threshold",
-    "relatorio",
-    "report",
-    "chat",
-    "thread",
-    "navegacao",
-    "pagina",
-    "exportacao",
-    "csv",
-    "pdf",
-}
-
-GREETING_KEYWORDS = {
-    "oi",
-    "ola",
-    "olá",
-    "hello",
-    "hi",
-    "ajuda",
-    "help",
-}
+OUT_OF_SCOPE_KEYWORDS = [
+    "futebol",
+    "copa",
+    "esporte",
+    "receita",
+    "culinaria",
+    "culinária",
+    "politica",
+    "política",
+    "presidente",
+    "noticia",
+    "notícia",
+    "clima",
+    "tempo",
+    "bitcoin",
+    "crypto",
+    "como programar",
+    "codigo",
+    "código",
+    "python tutorial",
+]
 
 
 class ChatService:
@@ -73,44 +48,25 @@ class ChatService:
         return text.strip()[:3000]
 
     @staticmethod
-    def _normalize_text(value: str) -> str:
-        lowered = (value or "").strip().lower()
-        normalized = normalize("NFD", lowered)
-        return "".join(ch for ch in normalized if category(ch) != "Mn")
-
-    @staticmethod
-    def _read_prompt_file(filename: str) -> str:
-        path = PROMPTS_DIR / filename
-        if not path.exists():
-            return ""
-        return path.read_text(encoding="utf-8").strip()
-
-    @staticmethod
-    def _domain_prompt_bundle() -> tuple[str, str]:
-        system_prompt = ChatService._read_prompt_file(SYSTEM_PROMPT_FILE)
-        knowledge = ChatService._read_prompt_file(KNOWLEDGE_FILE)
-        return system_prompt, knowledge
-
-    @staticmethod
-    def _has_domain_prompt_assets(system_prompt: str, knowledge: str) -> bool:
-        return bool(system_prompt.strip()) and bool(knowledge.strip())
+    def _load_system_prompt() -> str:
+        try:
+            system_prompt = (PROMPTS_DIR / "domain-closed-system-prompt.md").read_text(encoding="utf-8")
+            knowledge = (PROMPTS_DIR / "domain-knowledge-base.md").read_text(encoding="utf-8")
+            return f"{system_prompt}\n\n---\n\n## BASE DE CONHECIMENTO DO SISTEMA\n{knowledge}"
+        except Exception:
+            return "Você é o assistente do SentimentoIA. Responda apenas sobre análise de sentimentos."
 
     @staticmethod
     def _is_in_scope(message: str) -> bool:
-        normalized = ChatService._normalize_text(message)
-        if not normalized:
+        msg_lower = str(message or "").lower()
+        if not msg_lower.strip():
             return False
-
-        if normalized in GREETING_KEYWORDS:
-            return True
-
-        return any(keyword in normalized for keyword in DOMAIN_KEYWORDS)
+        return not any(keyword in msg_lower for keyword in OUT_OF_SCOPE_KEYWORDS)
 
     @staticmethod
     def _refusal_message(locale: str) -> str:
-        if locale == "en-US":
-            return "I can only help with SentimentoIA (navigation, settings, KPIs, and authorized account data)."
-        return "Posso ajudar apenas com o SentimentoIA (navegacao, configuracoes, KPIs e dados autorizados da sua conta)."
+        del locale
+        return "Posso ajudar apenas com análises de sentimento e reputação da sua marca no SentimentoIA."
 
     @staticmethod
     def _serialize_thread(item: dict[str, Any]) -> dict[str, Any]:
@@ -247,67 +203,7 @@ class ChatService:
 
     @staticmethod
     def _authorized_context(user_id: str) -> dict[str, Any]:
-        db = get_db()
-        if db is None:
-            raise RuntimeError(DB_UNAVAILABLE_ERROR)
-
-        settings_doc = InsightService.get_user_settings(user_id=user_id)
-        dashboard = DashboardService.get_dashboard(user_id=user_id, limit_mentions=50)
-
-        latest_batch = db.comment_batches.find_one({"user_id": user_id}, sort=[("updated_at", -1)])
-        latest_insight = db.insights.find_one(
-            {"user_id": user_id, "archived": False},
-            sort=[("created_at", -1)],
-        )
-
-        metrics = dashboard.get("metrics") or {}
-        latest_batch_summary = None
-        if latest_batch:
-            latest_batch_summary = {
-                "batch_id": latest_batch.get("batch_id"),
-                "status": latest_batch.get("status"),
-                "accepted_count": latest_batch.get("accepted_count"),
-                "processed_count": latest_batch.get("processed_count"),
-                "error_count": latest_batch.get("error_count"),
-                "updated_at": latest_batch.get("updated_at").isoformat()
-                if hasattr(latest_batch.get("updated_at"), "isoformat")
-                else latest_batch.get("updated_at"),
-            }
-
-        latest_insight_summary = None
-        if latest_insight:
-            latest_insight_summary = {
-                "insight_id": latest_insight.get("insight_id") or latest_insight.get("_id"),
-                "batch_id": latest_insight.get("batch_id"),
-                "trend": latest_insight.get("trend"),
-                "executive_summary": str(latest_insight.get("executive_summary") or "")[:400],
-                "created_at": latest_insight.get("created_at").isoformat()
-                if hasattr(latest_insight.get("created_at"), "isoformat")
-                else latest_insight.get("created_at"),
-            }
-
-        return {
-            "settings": settings_doc,
-            "dashboard": {
-                "batch_id": dashboard.get("batch_id"),
-                "total_mentions": metrics.get("total_mentions", 0),
-                "critical_mentions": metrics.get("critical_mentions", 0),
-                "average_urgency": metrics.get("average_urgency", 0),
-                "reputation_score": metrics.get("reputation_score", 0),
-                "sentiment_distribution": metrics.get("sentiment_distribution", {}),
-                "source_distribution": metrics.get("source_distribution", {}),
-                "top_aspects": metrics.get("top_aspects", {}),
-            },
-            "latest_batch": latest_batch_summary,
-            "latest_insight": latest_insight_summary,
-            "allowed_pages": [
-                "/search",
-                "/dashboard",
-                "/analysis",
-                "/reports",
-                "/settings",
-            ],
-        }
+        return build_authorized_context(user_id=user_id)
 
     @staticmethod
     async def send_message(
@@ -338,37 +234,43 @@ class ChatService:
         }
         db.chat_messages.insert_one(user_message)
 
-        if ChatService._is_in_scope(clean_content):
-            system_prompt, knowledge = ChatService._domain_prompt_bundle()
-            if not ChatService._has_domain_prompt_assets(system_prompt, knowledge):
-                assistant_content = ChatService._refusal_message(locale=locale)
-            else:
-                history_docs = list(
-                    db.chat_messages.find(
-                        {"user_id": user_id, "thread_id": thread_id, "role": {"$in": ["user", "assistant"]}}
-                    )
-                    .sort("created_at", -1)
-                    .limit(12)
-                )
-                history_docs.reverse()
-                history = [
-                    {
-                        "role": str(item.get("role") or "user"),
-                        "content": str(item.get("content") or ""),
-                    }
-                    for item in history_docs
-                ]
-                allowed_context = ChatService._authorized_context(user_id=user_id)
-                assistant_content = await LLMService.answer_domain_chat(
-                    locale=locale,
-                    system_prompt=system_prompt,
-                    knowledge_base=knowledge,
-                    authorized_context=allowed_context,
-                    history=history,
-                    user_message=clean_content,
-                )
-        else:
+        if not ChatService._is_in_scope(clean_content):
             assistant_content = ChatService._refusal_message(locale=locale)
+        else:
+            history_docs = list(
+                db.chat_messages.find(
+                    {"user_id": user_id, "thread_id": thread_id, "role": {"$in": ["user", "assistant"]}}
+                )
+                .sort("created_at", -1)
+                .limit(12)
+            )
+            history_docs.reverse()
+            history_messages = [
+                {
+                    "role": str(item.get("role") or "user"),
+                    "content": str(item.get("content") or ""),
+                }
+                for item in history_docs
+            ]
+
+            authorized_context = ChatService._authorized_context(user_id=user_id)
+            messages = [
+                {"role": "system", "content": ChatService._load_system_prompt()},
+                {
+                    "role": "system",
+                    "content": (
+                        "DADOS AUTORIZADOS DO USUÁRIO:\n"
+                        f"{json.dumps(authorized_context, ensure_ascii=False, default=str)}"
+                    ),
+                },
+                *history_messages,
+                {"role": "user", "content": clean_content},
+            ]
+
+            assistant_content = await LLMService.answer_domain_chat(
+                messages=messages,
+                authorized_context=authorized_context,
+            )
 
         now_response = utcnow()
         assistant_id = f"cmsg_{now_response.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"

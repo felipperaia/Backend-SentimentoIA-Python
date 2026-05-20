@@ -424,45 +424,78 @@ class InsightService:
             raise ValueError("Contexto sem mencoes processadas")
 
         metrics = EnrichmentService.aggregate(mentions)
-
         critical_terms_counter: Counter[str] = Counter()
         for mention in mentions:
             for term in mention.get("critical_terms") or []:
-                critical_terms_counter[term] += 1
+                critical_terms_counter[str(term)] += 1
 
-        max_samples = max(1, int(settings.LLM_MAX_SAMPLE_MENTIONS))
-        sample_mentions = []
-        for mention in mentions[:max_samples]:
-            sample_mentions.append(
-                {
-                    "text": (mention.get("text") or "")[:500],
-                    "sentiment": mention.get("sentiment"),
-                    "criticality": mention.get("criticality"),
-                    "urgency_score": mention.get("urgency_score"),
-                    "source": mention.get("source"),
-                }
-            )
+        sentiment_distribution = metrics.get("sentiment_distribution") or {}
+        positive_count = int(sentiment_distribution.get("positivo", sentiment_distribution.get("positive", 0)) or 0)
+        negative_count = int(sentiment_distribution.get("negativo", sentiment_distribution.get("negative", 0)) or 0)
+        neutral_count = int(sentiment_distribution.get("neutro", sentiment_distribution.get("neutral", 0)) or 0)
+
+        top_themes = list((metrics.get("top_aspects") or {}).keys())[:5]
+
+        negative_mentions = [
+            mention
+            for mention in mentions
+            if str(mention.get("sentiment") or "").lower() in {"negativo", "negative"}
+        ]
+        negative_mentions.sort(
+            key=lambda item: (
+                1 if str(item.get("criticality") or "").lower() in {"alta", "high", "critical"} else 0,
+                float(item.get("urgency_score") or 0),
+            ),
+            reverse=True,
+        )
+        top_negative_texts = [str(item.get("text") or "")[:500] for item in negative_mentions[:10] if item.get("text")]
+
+        positive_mentions = [
+            mention
+            for mention in mentions
+            if str(mention.get("sentiment") or "").lower() in {"positivo", "positive"}
+        ]
+        positive_mentions.sort(key=lambda item: float(item.get("reputation_score") or 0), reverse=True)
+        top_positive_texts = [str(item.get("text") or "")[:500] for item in positive_mentions[:5] if item.get("text")]
 
         source_distribution = Counter(str(mention.get("source") or "unknown") for mention in mentions)
-        source_references = []
-        for mention in mentions[:50]:
-            source_references.append(
-                {
-                    "mention_id": str(mention.get("_id") or ""),
-                    "source": str(mention.get("source") or "unknown"),
-                    "url": str(mention.get("url") or ""),
-                    "canonical_url": str(mention.get("canonical_url") or ""),
-                    "published_at": mention.get("published_at").isoformat()
-                    if isinstance(mention.get("published_at"), datetime)
-                    else mention.get("published_at"),
-                }
-            )
+        criticality_distribution = Counter(str(mention.get("criticality") or "unknown") for mention in mentions)
 
         published = [m.get("published_at") for m in mentions if isinstance(m.get("published_at"), datetime)]
         if published:
+            date_range = {
+                "start": min(published).isoformat(),
+                "end": max(published).isoformat(),
+            }
             period = f"{min(published).date().isoformat()}/{max(published).date().isoformat()}"
         else:
+            date_range = {"start": None, "end": None}
             period = "indefinido"
+
+        max_samples = max(1, int(settings.LLM_MAX_SAMPLE_MENTIONS))
+        sample_mentions = [
+            {
+                "text": (mention.get("text") or "")[:500],
+                "sentiment": mention.get("sentiment"),
+                "criticality": mention.get("criticality"),
+                "urgency_score": mention.get("urgency_score"),
+                "source": mention.get("source"),
+            }
+            for mention in mentions[:max_samples]
+        ]
+
+        source_references = [
+            {
+                "mention_id": str(mention.get("_id") or ""),
+                "source": str(mention.get("source") or "unknown"),
+                "url": str(mention.get("url") or ""),
+                "canonical_url": str(mention.get("canonical_url") or ""),
+                "published_at": mention.get("published_at").isoformat()
+                if isinstance(mention.get("published_at"), datetime)
+                else mention.get("published_at"),
+            }
+            for mention in mentions[:50]
+        ]
 
         return {
             "batch_id": context_id if context_type == "batch" else None,
@@ -470,16 +503,26 @@ class InsightService:
             "context_id": context_id,
             "context_type": context_type,
             "brand": brand_name,
+            "query": brand_name,
             "period": period,
+            "date_range": date_range,
+            "total_mentions": len(mentions),
             "total_comments": len(mentions),
-            "sentiment_distribution": metrics.get("sentiment_distribution", {}),
+            "positive_count": positive_count,
+            "negative_count": negative_count,
+            "neutral_count": neutral_count,
+            "sentiment_distribution": sentiment_distribution,
             "critical_mentions": int(metrics.get("critical_mentions", 0)),
             "average_urgency": float(metrics.get("average_urgency", 0)),
-            "top_aspects": list((metrics.get("top_aspects") or {}).keys())[:10],
-            "top_critical_terms": [term for term, _ in critical_terms_counter.most_common(10)],
+            "top_themes": top_themes,
+            "top_negative_texts": top_negative_texts,
+            "top_positive_texts": top_positive_texts,
             "source_distribution": dict(source_distribution),
+            "criticality_distribution": dict(criticality_distribution),
             "source_references": source_references,
             "sample_mentions": sample_mentions,
+            "top_aspects": list((metrics.get("top_aspects") or {}).keys())[:10],
+            "top_critical_terms": [term for term, _ in critical_terms_counter.most_common(10)],
         }
 
     @staticmethod
@@ -578,8 +621,7 @@ class InsightService:
                     context_id=context_id,
                     context_type=context_type,
                 )
-                analysis = await LLMService.analyze_snapshot(snapshot)
-                operational_fields = InsightService._build_operational_fields(snapshot=snapshot, analysis=analysis)
+                analysis = await LLMService.analyze_snapshot(snapshot=snapshot, user_id=user_id)
                 processed_count_now = InsightService._context_mentions_count(
                     user_id=user_id,
                     context_type=context_type,
@@ -591,40 +633,79 @@ class InsightService:
                 audit_metadata = {
                     "generated_at": now.isoformat(),
                     "provider": settings.LLM_PROVIDER,
-                    "model": settings.OLLAMA_MODEL,
+                    "model": "managed-by-gateway",
                     "threshold": int(job.get("threshold") or InsightService.get_threshold(user_id=user_id)),
                     "processed_count_at_enqueue": int(job.get("processed_count_at_enqueue") or 0),
                     "processed_count_at_generation": processed_count_now,
                     "job_trigger": str(job.get("trigger") or "auto"),
                     "deterministic_rules_version": "priority-v1",
                 }
-                insight_doc = {
-                    "_id": insight_id,
-                    "insight_id": insight_id,
-                    "job_id": job_id,
-                    "user_id": user_id,
-                    "batch_id": context_id if context_type == "batch" else None,
-                    "search_id": context_id if context_type == "search" else None,
-                    "context_id": context_id,
-                    "context_type": context_type,
-                    "trigger": job.get("trigger", "auto"),
-                    "archived": False,
-                    **operational_fields,
-                    "source_references": snapshot.get("source_references", []),
-                    "source_distribution": snapshot.get("source_distribution", {}),
-                    "audit_metadata": audit_metadata,
-                    "snapshot": snapshot,
-                    "executive_summary": analysis.get("executive_summary"),
-                    "sentiment_overview": analysis.get("sentiment_overview"),
-                    "risks": analysis.get("risks", []),
-                    "opportunities": analysis.get("opportunities", []),
-                    "recommended_actions": analysis.get("recommended_actions", []),
-                    "decision_guidance": analysis.get("decision_guidance"),
-                    "trend": analysis.get("trend", "indefinido"),
-                    "llm_payload": analysis,
-                    "created_at": now,
-                    "updated_at": now,
-                }
+                llm_unavailable = bool(analysis.get("llm_unavailable"))
+                if llm_unavailable:
+                    insight_doc = {
+                        "_id": insight_id,
+                        "insight_id": insight_id,
+                        "job_id": job_id,
+                        "user_id": user_id,
+                        "batch_id": context_id if context_type == "batch" else None,
+                        "search_id": context_id if context_type == "search" else None,
+                        "context_id": context_id,
+                        "context_type": context_type,
+                        "trigger": job.get("trigger", "auto"),
+                        "archived": False,
+                        "company": str(snapshot.get("brand") or "indefinida"),
+                        "priority": None,
+                        "urgency": None,
+                        "root_cause": None,
+                        "recommended_action": None,
+                        "status": "llm_unavailable",
+                        "resolution": "pending",
+                        "timestamp": utcnow().isoformat(),
+                        "priority_score": None,
+                        "source_references": snapshot.get("source_references", []),
+                        "source_distribution": snapshot.get("source_distribution", {}),
+                        "audit_metadata": audit_metadata,
+                        "snapshot": snapshot,
+                        "executive_summary": None,
+                        "sentiment_overview": None,
+                        "risks": None,
+                        "opportunities": None,
+                        "recommended_actions": None,
+                        "decision_guidance": None,
+                        "trend": None,
+                        "llm_payload": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                else:
+                    operational_fields = InsightService._build_operational_fields(snapshot=snapshot, analysis=analysis)
+                    insight_doc = {
+                        "_id": insight_id,
+                        "insight_id": insight_id,
+                        "job_id": job_id,
+                        "user_id": user_id,
+                        "batch_id": context_id if context_type == "batch" else None,
+                        "search_id": context_id if context_type == "search" else None,
+                        "context_id": context_id,
+                        "context_type": context_type,
+                        "trigger": job.get("trigger", "auto"),
+                        "archived": False,
+                        **operational_fields,
+                        "source_references": snapshot.get("source_references", []),
+                        "source_distribution": snapshot.get("source_distribution", {}),
+                        "audit_metadata": audit_metadata,
+                        "snapshot": snapshot,
+                        "executive_summary": analysis.get("executive_summary"),
+                        "sentiment_overview": analysis.get("sentiment_overview"),
+                        "risks": analysis.get("risks", []),
+                        "opportunities": analysis.get("opportunities", []),
+                        "recommended_actions": analysis.get("recommended_actions", []),
+                        "decision_guidance": analysis.get("decision_guidance"),
+                        "trend": analysis.get("trend", "stable"),
+                        "llm_payload": analysis,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
                 db.insights.insert_one(insight_doc)
 
                 db.insight_jobs.update_one(

@@ -27,6 +27,7 @@ class UserResponse(UserBase):
     role: UserRole = UserRole.USER
     mfa_enabled: bool = False
     mfa_verified: bool = False
+    data_rights_url: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     last_signed_in: Optional[datetime] = None

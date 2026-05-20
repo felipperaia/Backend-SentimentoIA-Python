@@ -26,14 +26,22 @@ class Settings(BaseSettings):
     MONGODB_URI: str = "mongodb://localhost:27017"
     DATABASE_NAME: str = "sentimento_db"
 
-    # LLM oficial do MVP: Ollama Cloud.
-    LLM_PROVIDER: str = "ollama"
-    OLLAMA_BASE_URL: str = "https://ollama.com/api"
-    # Legado: mantido para compatibilidade com ambientes antigos.
-    OLLAMA_CLOUD_URL: str = ""
+    # Removido: gateway externo. Conexao agora direta via OLLAMA_BASE_URL.
+    # LLM_PROVIDER foi mantido apenas para log/telemetria informativa.
+    LLM_PROVIDER: str = "ollama-direct"
+    OLLAMA_BASE_URL: str = ""
     OLLAMA_API_KEY: str = ""
     OLLAMA_MODEL: str = "llama3.1:8b"
     OLLAMA_TIMEOUT_SECONDS: int = 60
+
+    @property
+    def OLLAMA_EFFECTIVE_URL(self) -> str:
+        url = str(self.OLLAMA_BASE_URL or "").strip().rstrip("/")
+        if not url:
+            return ""
+        if url.lower().endswith("/api"):
+            return url
+        return f"{url}/api"
 
     # URL publica do frontend para links transacionais.
     FRONTEND_URL: str = "http://localhost:5173"
@@ -61,53 +69,18 @@ class Settings(BaseSettings):
     def SMTP_EFFECTIVE_FROM_EMAIL(self) -> str:
         return (self.SMTP_FROM or self.SMTP_FROM_EMAIL or "").strip()
 
-    # Legado: mantido apenas para não quebrar ambientes antigos.
-    OPENROUTER_API_KEY: str = ""
-    OPENROUTER_API_URL: str = "https://openrouter.ai/api/v1"
-    OPENROUTER_MODEL: str = "openrouter/free"
-    GROK_API_KEY: str = ""
-    GROK_API_URL: str = "https://openrouter.ai/api/v1"
-    GROK_MODEL: str = "openrouter/free"
+    APP_NAME: str = "SentimentoIA"
+    APP_URL: str = ""
 
-    @property
-    def LLM_API_KEY(self) -> str:
-        return (self.OPENROUTER_API_KEY or self.GROK_API_KEY or "").strip()
-
-    @property
-    def LLM_API_URL(self) -> str:
-        return (self.OPENROUTER_API_URL or self.GROK_API_URL or "https://openrouter.ai/api/v1").strip()
-
-    @property
-    def LLM_MODEL(self) -> str:
-        return (self.OPENROUTER_MODEL or self.GROK_MODEL or "openrouter/free").strip()
-
-    @property
-    def OLLAMA_EFFECTIVE_MODE(self) -> str:
-        return "cloud"
-
-    @property
-    def OLLAMA_EFFECTIVE_URL(self) -> str:
-        """Retorna base URL normalizada, sem trailing /api para evitar duplicacao.
-
-        Se o usuario configurar OLLAMA_BASE_URL=https://ollama.com/api,
-        esta property retorna https://ollama.com para que o servico monte
-        /api/generate corretamente.
-        """
-        configured_url = (self.OLLAMA_BASE_URL or self.OLLAMA_CLOUD_URL or "").strip().rstrip("/")
-        normalized = configured_url.lower()
-        if "localhost" in normalized or "127.0.0.1" in normalized:
-            return ""
-        # Remove trailing /api para evitar /api/api/generate
-        if normalized.endswith("/api"):
-            configured_url = configured_url[:-4]
-        return configured_url
+    PRIVACY_CONTACT_EMAIL: str = "privacidade@sentimentoia.com"
+    DATA_RETENTION_YEARS: int = 2
 
     # Scraping (POC/MVP)
     SCRAPER_USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-    SCRAPER_DELAY_SECONDS: float = 1.0
+    SCRAPER_DELAY_SECONDS: float = 5.0
     SCRAPER_TIMEOUT_SECONDS: int = 20
     SCRAPER_DEFAULT_LIMIT: int = 5
     SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,web"
@@ -124,6 +97,21 @@ class Settings(BaseSettings):
     SCRAPER_MASTODON_SEARCH_PATH: str = "/api/v2/search"
     SCRAPER_MASTODON_ACCESS_TOKEN: str = ""
     SCRAPER_WEB_SEARCH_URL: str = "https://duckduckgo.com/html/"
+
+    # Coleta em APIs oficiais / tiers estaveis
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USER_AGENT: str = "SentimentoIA/1.0"
+    YOUTUBE_API_KEY: str = ""
+    YOUTUBE_DAILY_QUOTA_LIMIT: int = 5000
+    COMPANY_APP_STORE_ID: str = ""
+    COMPANY_PLAY_STORE_ID: str = ""
+
+    # Coleta opcional em fontes mais sensiveis a bloqueio.
+    ENABLE_RECLAME_AQUI: bool = False
+    ENABLE_RECLAMEAQUI: bool = False
+    ENABLE_PLAYWRIGHT: bool = False
+    APIFY_TOKEN: str = ""
 
     # Cache e atualização automática
     CACHE_TTL_MINUTES: int = 30

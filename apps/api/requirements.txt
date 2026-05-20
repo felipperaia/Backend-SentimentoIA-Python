@@ -10,7 +10,7 @@ python-jose==3.3.0
 passlib==1.7.4
 pyotp==2.9.0
 requests==2.31.0
-httpx==0.25.2
+httpx[asyncio]>=0.27
 aiohttp==3.9.1
 python-multipart==0.0.6
 reportlab==4.0.7
@@ -23,7 +23,11 @@ qrcode[pil]
 textblob
 pytest
 
-beautifulsoup4
+beautifulsoup4>=4.12
+playwright>=1.44
+fake-useragent>=1.5
+app-store-scraper>=0.3
+google-play-scraper>=1.2
 
-lxml
+lxml>=5.0
 mongomock

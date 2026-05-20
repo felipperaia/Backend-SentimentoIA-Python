@@ -26,6 +26,13 @@ class SourceRegistryService:
         "twitter": "x",
         "reclame_aqui": "reclameaqui",
         "reclame-aqui": "reclameaqui",
+        "app-store": "appstore",
+        "app_store": "appstore",
+        "play-store": "playstore",
+        "play_store": "playstore",
+        "googleplay": "playstore",
+        "google-play": "playstore",
+        "yt": "youtube",
     }
 
     @staticmethod
@@ -35,42 +42,93 @@ class SourceRegistryService:
                 name="reclameaqui",
                 source_type="reputation",
                 base_url=settings.SCRAPER_RECLAMEAQUI_URL.rstrip("/"),
-                active=True,
-                priority=100,
-                fetch_mode="html",
-                rate_limit_per_minute=20,
-                parser="reclameaqui_html_parser",
+                active=bool(getattr(settings, "ENABLE_RECLAME_AQUI", False) or settings.ENABLE_RECLAMEAQUI),
+                priority=35,
+                fetch_mode="public_api_or_html",
+                rate_limit_per_minute=10,
+                parser="reclameaqui_public_parser",
             ),
             "reddit": SourceConfig(
                 name="reddit",
                 source_type="community",
                 base_url=settings.SCRAPER_REDDIT_URL.rstrip("/"),
                 active=True,
+                priority=100,
+                fetch_mode="public_json",
+                rate_limit_per_minute=60,
+                parser="reddit_public_json_parser",
+            ),
+            "youtube": SourceConfig(
+                name="youtube",
+                source_type="video_reviews",
+                base_url="https://www.youtube.com",
+                active=True,
+                priority=95,
+                fetch_mode="html_embedded_json",
+                rate_limit_per_minute=30,
+                parser="youtube_ytinitialdata_parser",
+            ),
+            "appstore": SourceConfig(
+                name="appstore",
+                source_type="mobile_reviews",
+                base_url="https://itunes.apple.com",
+                active=True,
+                priority=92,
+                fetch_mode="library_scraper",
+                rate_limit_per_minute=20,
+                parser="app_store_scraper_parser",
+            ),
+            "playstore": SourceConfig(
+                name="playstore",
+                source_type="mobile_reviews",
+                base_url="https://play.google.com",
+                active=True,
                 priority=90,
-                fetch_mode="json_api",
-                rate_limit_per_minute=40,
-                parser="reddit_json_parser",
+                fetch_mode="library_scraper",
+                rate_limit_per_minute=20,
+                parser="play_store_scraper_parser",
+            ),
+            "trustpilot": SourceConfig(
+                name="trustpilot",
+                source_type="review_portal",
+                base_url="https://br.trustpilot.com",
+                active=True,
+                priority=60,
+                fetch_mode="html_or_playwright",
+                rate_limit_per_minute=10,
+                parser="trustpilot_html_parser",
+            ),
+            "glassdoor": SourceConfig(
+                name="glassdoor",
+                source_type="review_portal",
+                base_url="https://www.glassdoor.com.br",
+                active=True,
+                priority=55,
+                fetch_mode="html_plus_fallback",
+                rate_limit_per_minute=8,
+                parser="glassdoor_html_parser",
             ),
             "mastodon": SourceConfig(
                 name="mastodon",
                 source_type="federated_social",
                 base_url=settings.SCRAPER_MASTODON_BASE_URL.rstrip("/"),
-                active=False,
+                active=True,
                 priority=80,
-                fetch_mode="json_api",
+                fetch_mode="public_json",
                 rate_limit_per_minute=30,
                 parser="mastodon_status_parser",
-                deprecated=True,
+                deprecated=False,
             ),
             "web": SourceConfig(
                 name="web",
                 source_type="open_web",
                 base_url=settings.SCRAPER_WEB_SEARCH_URL.rstrip("/"),
                 active=True,
-                priority=60,
-                fetch_mode="html",
+                priority=50,
+                fetch_mode="ddg_then_bing",
                 rate_limit_per_minute=30,
-                parser="duckduckgo_html_parser",
+                parser="web_search_snippet_parser",
+                deprecated=False,
             ),
             "google": SourceConfig(
                 name="google",
@@ -119,7 +177,7 @@ class SourceRegistryService:
         if selected:
             return selected
 
-        fallback = ["reclameaqui", "reddit", "web"]
+        fallback = ["reddit", "youtube", "appstore", "playstore", "web", "mastodon"]
         return [source for source in fallback if source in definitions and definitions[source].active]
 
     @staticmethod
@@ -158,7 +216,7 @@ class SourceRegistryService:
             if not config.active:
                 message = "Fonte despriorizada e inativa no nucleo atual"
                 if config.deprecated:
-                    message = "Fonte legada removida do nucleo. Use Reddit, Reclame Aqui ou Web"
+                    message = "Fonte legada removida do nucleo. Use Reddit, YouTube, App Store, Play Store, Web ou Mastodon"
                 errors.append({"source": source, "error": message})
                 continue
 
