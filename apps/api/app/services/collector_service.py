@@ -11,6 +11,19 @@ class CollectorService:
     """Converte itens do ScraperService em menções normalizadas para o pipeline."""
 
     @staticmethod
+    def _public_source_error(raw_error: Any) -> str:
+        text = str(raw_error or "").strip().lower()
+        if not text:
+            return "Falha temporaria na coleta da fonte"
+        if "timeout" in text or "timed out" in text:
+            return "Tempo limite excedido na coleta desta fonte"
+        if "limit" in text or "429" in text:
+            return "Limite temporario da fonte atingido"
+        if "nao suportada" in text or "indisponivel" in text:
+            return str(raw_error)
+        return "Falha temporaria na coleta da fonte"
+
+    @staticmethod
     async def collect(
         query: str,
         sources: list[str],
@@ -31,7 +44,8 @@ class CollectorService:
             )
         except Exception as exc:
             logger.exception("Falha geral na coleta por scraping")
-            return [], [{"source": "system", "error": str(exc)}]
+            del exc
+            return [], [{"source": "system", "error": "Falha temporaria no processamento de coleta"}]
 
         for source, source_items in (scraped.get("results") or {}).items():
             for item in source_items:
@@ -61,10 +75,10 @@ class CollectorService:
                 errors.append(
                     {
                         "source": str(source_error.get("source") or "unknown"),
-                        "error": str(source_error.get("error") or "Erro desconhecido"),
+                        "error": CollectorService._public_source_error(source_error.get("error") or ""),
                     }
                 )
             else:
-                errors.append({"source": "unknown", "error": str(source_error)})
+                errors.append({"source": "unknown", "error": CollectorService._public_source_error(source_error)})
 
         return mentions, errors

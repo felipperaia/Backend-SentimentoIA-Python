@@ -25,6 +25,53 @@ class SearchService:
     """
 
     @staticmethod
+    def _normalize_error_message(message: Any) -> str:
+        text = str(message or "").strip()
+        lowered = text.lower()
+        if not text:
+            return "Falha temporaria na coleta"
+
+        # Nunca expor detalhes internos de stack/upstream/model/gateway.
+        blocked_markers = [
+            "traceback",
+            "exception",
+            "stack",
+            "http://",
+            "https://",
+            "gateway",
+            "upstream",
+            "ollama",
+            "model",
+        ]
+        if any(marker in lowered for marker in blocked_markers):
+            return "Falha temporaria na coleta"
+
+        if "timeout" in lowered or "timed out" in lowered:
+            return "Tempo limite excedido na coleta"
+        if "429" in lowered or "rate limit" in lowered or "limite" in lowered:
+            return "Limite temporario da fonte atingido"
+
+        return text[:220]
+
+    @staticmethod
+    def _sanitize_error_entry(entry: Any) -> dict[str, str]:
+        if isinstance(entry, dict):
+            source = str(entry.get("source") or "unknown").strip().lower() or "unknown"
+            message = SearchService._normalize_error_message(entry.get("error") or entry.get("detail") or "")
+            return {"source": source, "error": message}
+
+        return {
+            "source": "unknown",
+            "error": SearchService._normalize_error_message(entry),
+        }
+
+    @staticmethod
+    def _sanitize_errors(errors: Any) -> list[dict[str, str]]:
+        if not isinstance(errors, list):
+            return []
+        return [SearchService._sanitize_error_entry(item) for item in errors]
+
+    @staticmethod
     async def run_search(
         *,
         user_id: str,
@@ -58,6 +105,7 @@ class SearchService:
             )
             if cached:
                 mentions = list(db.mentions.find({"search_id": cached["search_id"]}, {"raw": 0}).sort("published_at", -1))
+                sanitized_errors = SearchService._sanitize_errors(cached.get("errors", []))
                 return {
                     "search_id": cached["search_id"],
                     "query": query,
@@ -66,7 +114,8 @@ class SearchService:
                     "mentions": SearchService.serialize_many(mentions),
                     "metrics": cached.get("metrics", {}),
                     "llm_analysis": cached.get("llm_analysis", {}),
-                    "errors": cached.get("errors", []),
+                    "alerts": [],
+                    "errors": sanitized_errors,
                 }
 
         search_id = make_search_id()
@@ -87,6 +136,7 @@ class SearchService:
             locality=locality,
             user_id=user_id,
         )
+        errors = SearchService._sanitize_errors(errors)
         collected = SearchService._dedupe_mentions_in_memory(collected)
 
         enriched_mentions: list[dict[str, Any]] = []

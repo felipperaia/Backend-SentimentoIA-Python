@@ -35,6 +35,11 @@ class CollectorOrchestrator:
         self.last_errors: list[dict[str, str]] = []
 
     @staticmethod
+    def _public_source_error(source_name: str) -> str:
+        del source_name
+        return "Falha temporaria na coleta desta fonte"
+
+    @staticmethod
     def _collectors_map() -> dict[str, type[BaseCollector]]:
         return {
             "reddit": RedditCollector,
@@ -81,7 +86,12 @@ class CollectorOrchestrator:
 
         for source_name in selected_sources:
             if source_name not in collectors_map:
-                self.last_errors.append({"source": source_name, "error": "fonte sem coletor"})
+                self.last_errors.append(
+                    {
+                        "source": source_name,
+                        "error": "Fonte indisponivel no coletor atual",
+                    }
+                )
                 results[source_name] = []
                 continue
 
@@ -97,9 +107,13 @@ class CollectorOrchestrator:
                 valid_items = [item for item in items if isinstance(item, dict)]
                 results[source_name] = valid_items[:max_per_source]
             except Exception as exc:
-                message = f"{type(exc).__name__}: {exc}"
-                logger.warning("Coletor %s falhou: %s", source_name, message)
-                self.last_errors.append({"source": source_name, "error": message})
+                logger.warning("Coletor %s falhou: %s", source_name, type(exc).__name__)
+                self.last_errors.append(
+                    {
+                        "source": source_name,
+                        "error": CollectorOrchestrator._public_source_error(source_name),
+                    }
+                )
                 results[source_name] = []
 
         return results

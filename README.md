@@ -240,6 +240,18 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir apps/api
 python -m apps.worker.app.worker
 ```
 
+### hostingguru.io (backend oficial)
+
+Configurar o servico da API com:
+
+- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir apps/api`
+- Working directory: raiz do repositorio `backend-api-python`
+
+Configurar o worker como servico separado com:
+
+- Start command: `python -m apps.worker.app.worker`
+- Mesmo arquivo de ambiente da API (`apps/api/.env`)
+
 Checklist minimo de producao:
 
 - `ENV=production`

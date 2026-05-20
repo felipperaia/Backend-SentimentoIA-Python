@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from app.api.admin_router import router as admin_router
 from app.api.auth_router import router as auth_router
 from app.api.ingestion_router import router as ingestion_router
 from app.api.mentions_router import router as mentions_router
@@ -65,6 +66,71 @@ class PrivacyConsentRequest(BaseModel):
     session_id: str
     analytics: bool
     marketing: bool
+
+
+INTERNAL_ERROR_MARKERS = (
+    "traceback",
+    "stack",
+    "exception",
+    "gateway",
+    "upstream",
+    "ollama",
+    "model",
+    "http://",
+    "https://",
+)
+
+
+def _default_http_error_message(status_code: int) -> str:
+    if status_code == 400:
+        return "Requisicao invalida. Verifique os dados informados."
+    if status_code == 401:
+        return "Sessao invalida ou expirada. Faca login novamente."
+    if status_code == 403:
+        return "Acesso negado para esta operacao."
+    if status_code == 404:
+        return "Recurso nao encontrado."
+    if status_code in {408, 504}:
+        return "Tempo limite excedido. Tente novamente."
+    if status_code == 429:
+        return "Muitas requisicoes em sequencia. Aguarde e tente novamente."
+    if status_code >= 500:
+        return "Erro interno. Tente novamente em instantes."
+    return "Nao foi possivel concluir a solicitacao."
+
+
+def _extract_detail_text(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail.strip()
+    if isinstance(detail, dict):
+        for key in ("detail", "message", "error"):
+            value = detail.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+    if isinstance(detail, list) and detail:
+        first = detail[0]
+        if isinstance(first, dict):
+            for key in ("msg", "detail", "message"):
+                value = first.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _sanitize_http_detail(status_code: int, detail: Any) -> str:
+    text = _extract_detail_text(detail)
+    if not text:
+        return _default_http_error_message(status_code)
+
+    lowered = text.lower()
+    if any(marker in lowered for marker in INTERNAL_ERROR_MARKERS):
+        return _default_http_error_message(status_code)
+
+    if len(text) > 240:
+        return _default_http_error_message(status_code)
+
+    return text
 
 
 def _hash_ip_prefix(ip_address: str | None) -> str:
@@ -146,7 +212,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS_EFFECTIVE or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -158,13 +224,37 @@ async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    )
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
 app.include_router(auth_router, prefix="/api/auth", tags=["Autenticação"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_request: Request, exc: HTTPException):
+    detail = _sanitize_http_detail(exc.status_code, exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "error": detail,
+            "detail": detail,
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -183,7 +273,6 @@ async def global_exception_handler(request: Request, exc: Exception):
             "ok": False,
             "error": error_message,
             "request_id": request_id,
-            "path": str(request.url.path),
         },
     )
 
@@ -207,6 +296,25 @@ async def privacy_policy():
             f"{max(1, int(settings.DATA_RETENTION_YEARS))} anos de inatividade."
         ),
         "contact": settings.PRIVACY_CONTACT_EMAIL or "privacidade@sentimentoia.com",
+    }
+
+
+@app.get("/api/privacy/rights")
+@app.get("/api/lgpd/rights")
+async def privacy_rights():
+    return {
+        "law": "LGPD",
+        "rights": [
+            "acesso",
+            "correcao",
+            "anonimizacao",
+            "portabilidade",
+            "eliminacao",
+            "informacao_sobre_compartilhamento",
+            "revogacao_de_consentimento",
+        ],
+        "contact": settings.PRIVACY_CONTACT_EMAIL or "privacidade@sentimentoia.com",
+        "retention_years": max(1, int(settings.DATA_RETENTION_YEARS or 2)),
     }
 
 
@@ -237,6 +345,39 @@ async def privacy_consent(
     db.user_consents.insert_one(consent_doc)
 
     return {"ok": True}
+
+
+@app.get("/api/privacy/export-summary")
+async def privacy_export_summary(current_user: dict[str, Any] = Depends(get_current_user)):
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Banco de dados indisponivel")
+
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    collections = [
+        "mentions",
+        "search_jobs",
+        "insights",
+        "chat_threads",
+        "chat_messages",
+        "nps_responses",
+        "alerts",
+        "reports",
+    ]
+    summary: dict[str, int] = {}
+    total_records = 0
+    for collection in collections:
+        count = int(db[collection].count_documents({"user_id": user_id}))
+        summary[collection] = count
+        total_records += count
+
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "total_records": total_records,
+        "collections": summary,
+        "generated_at": utcnow().isoformat(),
+    }
 
 
 @app.get("/api/status/integrations")
@@ -324,12 +465,12 @@ async def dashboard(
 async def mentions(
     batch_id: str | None = Query(None),
     search_id: str | None = Query(None),
-    status: str = Query("processed"),
+    status: str | None = Query(None),
     sentiment: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Lista mencoes do pipeline processado, com filtros por batch/status/sentimento."""
+    """Lista mencoes por contexto, com filtros opcionais por status e sentimento."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     selected_batch_id = batch_id or search_id
 
@@ -862,6 +1003,7 @@ async def nps_metrics(
     return NpsService.get_metrics(period_days=period_days, module_key=module_key)
 
 
-# Routers adicionais registrados sem expor admin_router.
+# Routers adicionais para compatibilidade com endpoints especializados.
 app.include_router(mentions_router, prefix="/api/mentions")
 app.include_router(reports_router, prefix="/api/reports-admin")
+app.include_router(admin_router, prefix="/api/admin")

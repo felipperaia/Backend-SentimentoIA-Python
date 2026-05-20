@@ -34,6 +34,45 @@ OUT_OF_SCOPE_KEYWORDS = [
     "código",
     "python tutorial",
 ]
+IN_SCOPE_KEYWORDS = [
+    "sentimento",
+    "sentiment",
+    "reputacao",
+    "reputação",
+    "marca",
+    "dashboard",
+    "insight",
+    "insights",
+    "mencoes",
+    "menções",
+    "alerta",
+    "alertas",
+    "relatorio",
+    "relatorio",
+    "nps",
+    "busca",
+    "comentarios",
+    "comentários",
+    "critico",
+    "crítico",
+    "criticidade",
+    "acao",
+    "ação",
+    "prioridade",
+    "risco",
+    "riscos",
+    "oportunidade",
+    "oportunidades",
+    "resolucao",
+    "resolução",
+    "filtro",
+    "filtros",
+    "fonte",
+    "fontes",
+    "pesquisa",
+    "relatorios",
+    "relatórios",
+]
 
 
 class ChatService:
@@ -57,16 +96,34 @@ class ChatService:
             return "Você é o assistente do SentimentoIA. Responda apenas sobre análise de sentimentos."
 
     @staticmethod
+    def _scope_verdict(message: str) -> tuple[bool, str]:
+        msg_lower = str(message or "").lower().strip()
+        if not msg_lower:
+            return False, "empty_message"
+
+        if any(keyword in msg_lower for keyword in OUT_OF_SCOPE_KEYWORDS):
+            return False, "blocked_keyword"
+
+        if any(keyword in msg_lower for keyword in IN_SCOPE_KEYWORDS):
+            return True, "domain_keyword"
+
+        # Dominio fechado: sem sinal claro de SentimentoIA, a mensagem e recusada.
+        return False, "missing_domain_signal"
+
+    @staticmethod
     def _is_in_scope(message: str) -> bool:
-        msg_lower = str(message or "").lower()
-        if not msg_lower.strip():
-            return False
-        return not any(keyword in msg_lower for keyword in OUT_OF_SCOPE_KEYWORDS)
+        verdict, _reason = ChatService._scope_verdict(message)
+        return verdict
 
     @staticmethod
     def _refusal_message(locale: str) -> str:
         del locale
         return "Posso ajudar apenas com análises de sentimento e reputação da sua marca no SentimentoIA."
+
+    @staticmethod
+    def _temporary_unavailable_message(locale: str) -> str:
+        del locale
+        return "Assistente temporariamente indisponivel. Tente novamente em instantes."
 
     @staticmethod
     def _serialize_thread(item: dict[str, Any]) -> dict[str, Any]:
@@ -234,8 +291,14 @@ class ChatService:
         }
         db.chat_messages.insert_one(user_message)
 
-        if not ChatService._is_in_scope(clean_content):
+        in_scope, refusal_reason = ChatService._scope_verdict(clean_content)
+        assistant_metadata: dict[str, Any] = {"out_of_scope": False}
+        if not in_scope:
             assistant_content = ChatService._refusal_message(locale=locale)
+            assistant_metadata = {
+                "out_of_scope": True,
+                "refusal_reason": refusal_reason,
+            }
         else:
             history_docs = list(
                 db.chat_messages.find(
@@ -271,6 +334,12 @@ class ChatService:
                 messages=messages,
                 authorized_context=authorized_context,
             )
+            if not isinstance(assistant_content, str) or not assistant_content.strip():
+                assistant_content = ChatService._temporary_unavailable_message(locale=locale)
+                assistant_metadata = {
+                    "out_of_scope": False,
+                    "fallback_reason": "empty_or_invalid_llm_response",
+                }
 
         now_response = utcnow()
         assistant_id = f"cmsg_{now_response.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
@@ -281,6 +350,7 @@ class ChatService:
             "user_id": user_id,
             "role": "assistant",
             "content": assistant_content[:3500],
+            "metadata": assistant_metadata,
             "created_at": now_response,
         }
         db.chat_messages.insert_one(assistant_message)

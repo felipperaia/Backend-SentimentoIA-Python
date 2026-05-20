@@ -15,6 +15,25 @@ class NpsService:
     """Serviço NPS para medir satisfação dos serviços do sistema."""
 
     @staticmethod
+    def _min_interactions_met(*, db, user_id: str | None) -> bool:
+        min_interactions = max(0, int(getattr(settings, "NPS_MIN_INTERACTIONS", 0) or 0))
+        if min_interactions <= 0:
+            return True
+
+        if not user_id:
+            return False
+
+        completed_searches = int(
+            db.search_jobs.count_documents(
+                {
+                    "user_id": user_id,
+                    "status": "completed",
+                }
+            )
+        )
+        return completed_searches >= min_interactions
+
+    @staticmethod
     def submit_response(
         *,
         user_id: str | None,
@@ -91,7 +110,7 @@ class NpsService:
 
     @staticmethod
     def should_show_nps(user_id: str | None, session_id: str) -> dict[str, Any]:
-        """Verifica se deve mostrar NPS com trigger de decisão."""
+        """Mostra NPS apenas em trigger pos-busca, com cooldown e sessao inedita."""
         result: dict[str, Any] = {"should_show": False, "trigger": None}
 
         if not settings.NPS_ENABLED:
@@ -99,6 +118,9 @@ class NpsService:
 
         db = get_db()
         if db is None:
+            return result
+
+        if not NpsService._min_interactions_met(db=db, user_id=user_id):
             return result
 
         session_query: dict[str, Any] = {"session_id": session_id}
@@ -122,21 +144,23 @@ class NpsService:
         if not search_doc:
             return result
 
-        history_query: dict[str, Any] = {"user_id": user_id} if user_id else {"session_id": session_id}
+        history_query: dict[str, Any] = {"user_id": user_id} if user_id else {"session_id": {"$ne": session_id}}
         last_response = db.nps_responses.find_one(history_query, sort=[("created_at", -1)])
-        if not last_response:
-            return {"should_show": True, "trigger": "first_use"}
+        search_timestamp = search_doc.get("updated_at") or search_doc.get("created_at")
+        last_created_at = last_response.get("created_at") if isinstance(last_response, dict) else None
 
         cooldown_cutoff = utcnow() - timedelta(days=max(1, int(settings.NPS_COOLDOWN_DAYS or 7)))
-        last_created_at = last_response.get("created_at")
         if isinstance(last_created_at, datetime) and last_created_at > cooldown_cutoff:
             return result
 
-        search_timestamp = search_doc.get("updated_at") or search_doc.get("created_at")
-        if isinstance(last_created_at, datetime) and isinstance(search_timestamp, datetime) and search_timestamp > last_created_at:
-            return {"should_show": True, "trigger": "post_search"}
+        if isinstance(last_created_at, datetime) and isinstance(search_timestamp, datetime):
+            if search_timestamp <= last_created_at:
+                return result
 
-        return {"should_show": True, "trigger": "cooldown_elapsed"}
+        if isinstance(search_timestamp, datetime) and search_timestamp < recent_search_cutoff:
+            return result
+
+        return {"should_show": True, "trigger": "post_search"}
 
     @staticmethod
     def get_metrics(

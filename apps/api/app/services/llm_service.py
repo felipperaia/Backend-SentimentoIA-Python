@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class LLMService:
-    """Servico de IA com conexao direta ao Ollama."""
+    """Servico de IA com chamada direta ao Ollama."""
 
     REDACTED = "[redacted]"
     SENSITIVE_KEY_PATTERN = re.compile(
@@ -35,42 +35,39 @@ class LLMService:
 
     @staticmethod
     def _effective_base_url() -> str:
-        legacy_gateway_url = LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_URL")
-        if legacy_gateway_url:
-            return LLMService._normalize_api_base_url(legacy_gateway_url)
-
-        legacy_gateway_base_url = LLMService._settings_str("LLM_GATEWAY_BASE_URL")
-        if legacy_gateway_base_url:
-            return LLMService._normalize_api_base_url(legacy_gateway_base_url)
-
-        direct_url = LLMService._settings_str("OLLAMA_EFFECTIVE_URL")
-        if direct_url:
-            return LLMService._normalize_api_base_url(direct_url)
-
-        return ""
+        direct_url = (
+            LLMService._settings_str("OLLAMA_EFFECTIVE_URL")
+            or LLMService._settings_str("OLLAMA_BASE_URL")
+        )
+        return LLMService._normalize_api_base_url(direct_url)
 
     @staticmethod
     def _effective_api_key() -> str:
         return (
-            LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_API_KEY")
-            or LLMService._settings_str("LLM_GATEWAY_API_KEY")
-            or LLMService._settings_str("OLLAMA_API_KEY")
+            LLMService._settings_str("OLLAMA_API_KEY")
+            or LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_API_KEY")
+        )
+
+    @staticmethod
+    def _effective_model() -> str:
+        return (
+            LLMService._settings_str("LLM_MODEL_EFFECTIVE")
+            or LLMService._settings_str("OLLAMA_MODEL")
         )
 
     @staticmethod
     def _gateway_base_url() -> str:
-        return LLMService._settings_str("LLM_GATEWAY_EFFECTIVE_URL") or LLMService._settings_str("LLM_GATEWAY_BASE_URL")
+        # Compatibilidade com chamadas antigas; gateway foi removido.
+        return ""
 
     @staticmethod
     def _gateway_mode() -> bool:
-        return bool(LLMService._gateway_base_url())
+        # Compatibilidade com chamadas antigas; gateway foi removido.
+        return False
 
     @staticmethod
     def ollama_configured() -> bool:
-        base_url = LLMService._effective_base_url()
-        if LLMService._gateway_mode():
-            return bool(base_url and LLMService._effective_api_key())
-        return bool(base_url)
+        return bool(LLMService._effective_base_url() and LLMService._effective_model())
 
     @staticmethod
     def gateway_configured() -> bool:
@@ -92,14 +89,11 @@ class LLMService:
 
     @staticmethod
     def _llm_timeout_seconds() -> int:
-        if LLMService._gateway_mode():
-            value = getattr(settings, "LLM_GATEWAY_TIMEOUT_SECONDS_EFFECTIVE", None)
-            if isinstance(value, int):
-                return max(1, value)
-            legacy_value = getattr(settings, "LLM_GATEWAY_TIMEOUT_SECONDS", None)
-            if isinstance(legacy_value, int):
-                return max(1, legacy_value)
-        return max(1, int(settings.OLLAMA_TIMEOUT_SECONDS or 60))
+        value = getattr(settings, "OLLAMA_TIMEOUT_SECONDS", 60)
+        try:
+            return max(1, int(value or 60))
+        except (TypeError, ValueError):
+            return 60
 
     @staticmethod
     def _build_ollama_url(endpoint: str) -> str:
@@ -171,7 +165,7 @@ class LLMService:
                 maybe_message = first.get("message")
                 if isinstance(maybe_message, dict):
                     content = maybe_message.get("content")
-                    if isinstance(content, str):
+                    if isinstance(content, str) and content.strip():
                         return content.strip()
 
         return ""
@@ -201,21 +195,16 @@ class LLMService:
     @staticmethod
     def normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
         data = raw if isinstance(raw, dict) else {}
-
         return {
             "executive_summary": str(data.get("executive_summary") or "Analise indisponivel no momento."),
             "sentiment_overview": str(data.get("sentiment_overview") or "Resumo de sentimento indisponivel."),
             "priority": str(data.get("priority") or "medium").lower(),
             "risks": data.get("risks") if isinstance(data.get("risks"), list) else [],
             "opportunities": data.get("opportunities") if isinstance(data.get("opportunities"), list) else [],
-            "recommended_actions": (
-                data.get("recommended_actions") if isinstance(data.get("recommended_actions"), list) else []
-            ),
+            "recommended_actions": data.get("recommended_actions") if isinstance(data.get("recommended_actions"), list) else [],
             "decision_guidance": str(data.get("decision_guidance") or "Direcionamento indisponivel."),
             "trend": str(data.get("trend") or "stable").lower(),
-            "source_references": (
-                data.get("source_references") if isinstance(data.get("source_references"), list) else []
-            ),
+            "source_references": data.get("source_references") if isinstance(data.get("source_references"), list) else [],
             "resolution": str(data.get("resolution") or "pending").lower(),
         }
 
@@ -241,7 +230,7 @@ class LLMService:
     @staticmethod
     def snapshot_prompt(snapshot: dict[str, Any]) -> str:
         schema = {
-            "executive_summary": "string: 2-3 paragrafos",
+            "executive_summary": "string",
             "sentiment_overview": "string",
             "priority": "high|medium|low",
             "risks": ["string"],
@@ -250,12 +239,12 @@ class LLMService:
             "decision_guidance": "string",
             "trend": "improving|stable|worsening",
             "source_references": ["string"],
-            "resolution": "pending",
+            "resolution": "pending|in_progress|resolved",
         }
 
         return (
-            "Voce deve responder SOMENTE em JSON valido. Nao invente dados fora do snapshot. "
-            "Use exclusivamente o conteudo recebido e mantenha foco em analise executiva de sentimento.\n\n"
+            "Responda SOMENTE em JSON valido. "
+            "Nao invente dados fora do snapshot e nao retorne markdown.\n\n"
             f"Formato obrigatorio:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
             f"Snapshot:\n{json.dumps(snapshot, ensure_ascii=False, default=str)}"
         )
@@ -300,7 +289,7 @@ class LLMService:
 
     @staticmethod
     def _sanitize_context_for_llm(value: Any, parent_key: str = "") -> Any:
-        # Compatibilidade com chamadas antigas.
+        del parent_key
         if isinstance(value, dict):
             return LLMService.sanitize_context(value)
         return value
@@ -332,16 +321,19 @@ class LLMService:
 
     @staticmethod
     async def call_ollama(prompt: str, format_json: bool = False) -> dict[str, Any]:
+        model = LLMService._effective_model()
+        if not model:
+            raise RuntimeError("OLLAMA_MODEL nao configurado")
+
         url = LLMService._build_ollama_url("generate")
         timeout = LLMService._llm_timeout_seconds()
 
         payload: dict[str, Any] = {
+            "model": model,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.2},
         }
-        if not LLMService._gateway_mode():
-            payload["model"] = settings.OLLAMA_MODEL
         if format_json:
             payload["format"] = "json"
 
@@ -352,18 +344,20 @@ class LLMService:
 
     @staticmethod
     async def _call_ollama(prompt: str, model: str | None = None) -> dict[str, Any]:
-        # Compatibilidade com testes/fluxos antigos.
+        selected_model = str(model or LLMService._effective_model()).strip()
+        if not selected_model:
+            raise RuntimeError("OLLAMA_MODEL nao configurado")
+
         url = LLMService._build_ollama_url("generate")
         timeout = LLMService._llm_timeout_seconds()
 
         payload: dict[str, Any] = {
+            "model": selected_model,
             "prompt": prompt,
             "stream": False,
             "format": "json",
             "options": {"temperature": 0.2},
         }
-        if not LLMService._gateway_mode():
-            payload["model"] = str(model or settings.OLLAMA_MODEL)
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -373,16 +367,19 @@ class LLMService:
 
     @staticmethod
     async def call_ollama_chat(messages: list[dict[str, Any]]) -> str:
+        model = LLMService._effective_model()
+        if not model:
+            raise RuntimeError("OLLAMA_MODEL nao configurado")
+
         url = LLMService._build_ollama_url("chat")
         timeout = LLMService._llm_timeout_seconds()
 
         payload = {
+            "model": model,
             "messages": messages,
             "stream": False,
             "options": {"temperature": 0.15},
         }
-        if not LLMService._gateway_mode():
-            payload["model"] = settings.OLLAMA_MODEL
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -392,17 +389,19 @@ class LLMService:
 
     @staticmethod
     async def _call_ollama_text(prompt: str, model: str | None = None) -> str:
-        # Compatibilidade com chamadas antigas.
+        selected_model = str(model or LLMService._effective_model()).strip()
+        if not selected_model:
+            raise RuntimeError("OLLAMA_MODEL nao configurado")
+
         url = LLMService._build_ollama_url("chat")
         timeout = LLMService._llm_timeout_seconds()
 
         payload = {
+            "model": selected_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {"temperature": 0.15},
         }
-        if not LLMService._gateway_mode():
-            payload["model"] = str(model or settings.OLLAMA_MODEL)
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, headers=LLMService._ollama_headers(), json=payload)
@@ -427,7 +426,7 @@ class LLMService:
         prompt = LLMService.snapshot_prompt(safe_snapshot)
 
         try:
-            parsed = await LLMService._call_ollama(prompt, model=settings.OLLAMA_MODEL)
+            parsed = await LLMService._call_ollama(prompt, model=LLMService._effective_model())
             if not isinstance(parsed, dict):
                 parsed = {}
 
@@ -451,6 +450,7 @@ class LLMService:
             sentiment = str(mention.get("sentiment") or "neutral").lower()
             sentiments[sentiment] = sentiments.get(sentiment, 0) + 1
 
+        max_samples = max(1, int(getattr(settings, "LLM_MAX_SAMPLE_MENTIONS", 40) or 40))
         snapshot = {
             "brand": brand or "indefinida",
             "query": brand or "indefinida",
@@ -463,7 +463,7 @@ class LLMService:
                     "text": str(mention.get("text") or "")[:500],
                     "criticality": mention.get("criticality"),
                 }
-                for mention in mentions[: max(1, int(settings.LLM_MAX_SAMPLE_MENTIONS))]
+                for mention in mentions[:max_samples]
             ],
         }
         return await LLMService.analyze_snapshot(snapshot=snapshot)
@@ -474,76 +474,85 @@ class LLMService:
         authorized_context: dict | None = None,
         **legacy_kwargs: Any,
     ) -> str:
-        fallback = "Desculpe, o assistente está temporariamente indisponível."
+        fallback = "Desculpe, o assistente esta temporariamente indisponivel."
 
         if not LLMService.ollama_configured():
             return fallback
 
-        if legacy_kwargs:
-            safe_context = LLMService._redact_for_prompt(authorized_context or {})
-            safe_history = LLMService._redact_for_prompt(legacy_kwargs.get("history") or [])
-            user_message = LLMService._redact_text(legacy_kwargs.get("user_message") or "")
-            rendered_prompt = "\n\n".join(
-                [
-                    str(legacy_kwargs.get("system_prompt") or "Sistema SentimentoIA"),
-                    f"Locale: {legacy_kwargs.get('locale') or 'pt-BR'}",
-                    f"Base de conhecimento:\n{LLMService._redact_text(legacy_kwargs.get('knowledge_base') or '')}",
-                    "Intencoes permitidas: get_user_dashboard_summary, list_mentions, generate_insight, explain_dashboard",
-                    "Contexto autorizado:\n"
-                    f"{json.dumps(safe_context, ensure_ascii=False, default=str)}",
-                    "Historico:\n"
-                    f"{json.dumps(safe_history, ensure_ascii=False, default=str)}",
-                    f"Mensagem do usuario:\n{user_message}",
-                ]
-            )
-            try:
-                response = await LLMService._call_ollama_text(rendered_prompt, model=settings.OLLAMA_MODEL)
+        try:
+            if legacy_kwargs:
+                safe_context = LLMService._redact_for_prompt(authorized_context or {})
+                safe_history = LLMService._redact_for_prompt(legacy_kwargs.get("history") or [])
+                user_message = LLMService._redact_text(legacy_kwargs.get("user_message") or "")
+                rendered_prompt = "\n\n".join(
+                    [
+                        str(legacy_kwargs.get("system_prompt") or "Sistema SentimentoIA"),
+                        f"Locale: {legacy_kwargs.get('locale') or 'pt-BR'}",
+                        f"Base de conhecimento:\n{LLMService._redact_text(legacy_kwargs.get('knowledge_base') or '')}",
+                        "Intencoes permitidas: get_user_dashboard_summary, list_mentions, generate_insight, explain_dashboard",
+                        "Contexto autorizado:\n"
+                        f"{json.dumps(safe_context, ensure_ascii=False, default=str)}",
+                        "Historico:\n"
+                        f"{json.dumps(safe_history, ensure_ascii=False, default=str)}",
+                        f"Mensagem do usuario:\n{user_message}",
+                    ]
+                )
+                response = await LLMService._call_ollama_text(
+                    rendered_prompt,
+                    model=legacy_kwargs.get("model") or LLMService._effective_model(),
+                )
                 return response if response else fallback
-            except (httpx.HTTPError, httpx.TimeoutException, RuntimeError, ValueError) as exc:
-                logger.exception("Falha no chat LLM legado: %s", exc)
+
+            safe_context = LLMService.sanitize_context(authorized_context or {})
+            safe_messages: list[dict[str, str]] = []
+
+            if safe_context:
+                safe_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "DADOS AUTORIZADOS DO USUARIO (FILTRADOS):\n"
+                            f"{json.dumps(safe_context, ensure_ascii=False, default=str)}"
+                        ),
+                    }
+                )
+
+            for message in messages or []:
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "user").strip().lower()
+                if role not in {"system", "user", "assistant"}:
+                    role = "user"
+                content = str(message.get("content") or "").strip()
+                if not content:
+                    continue
+                safe_messages.append({"role": role, "content": content[:6000]})
+
+            if not safe_messages:
                 return fallback
 
-        safe_context = LLMService.sanitize_context(authorized_context or {})
-        system_context_message = {
-            "role": "system",
-            "content": (
-                "DADOS AUTORIZADOS DO USUARIO (FILTRADOS):\n"
-                f"{json.dumps(safe_context, ensure_ascii=False, default=str)}"
-            ),
-        }
-
-        safe_messages: list[dict[str, str]] = [system_context_message]
-        for message in messages or []:
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role") or "user").strip().lower()
-            if role not in {"system", "user", "assistant"}:
-                role = "user"
-            content = str(message.get("content") or "").strip()
-            if not content:
-                continue
-            safe_messages.append({"role": role, "content": content[:6000]})
-
-        prompt_parts = [f"{item.get('role', 'user').upper()}:\n{item.get('content', '')}" for item in safe_messages]
-        rendered_prompt = "\n\n".join(prompt_parts)
-
-        try:
-            response = await LLMService._call_ollama_text(rendered_prompt, model=settings.OLLAMA_MODEL)
+            prompt_parts = [f"{item.get('role', 'user').upper()}:\n{item.get('content', '')}" for item in safe_messages]
+            rendered_prompt = "\n\n".join(prompt_parts)
+            response = await LLMService._call_ollama_text(
+                rendered_prompt,
+                model=LLMService._effective_model(),
+            )
             return response if response else fallback
         except (httpx.HTTPError, httpx.TimeoutException, RuntimeError, ValueError) as exc:
-            logger.exception("Falha no chat Ollama direto: %s", exc)
+            logger.exception("Falha no chat Ollama: %s", exc)
             return fallback
 
     @staticmethod
     async def health_check() -> dict[str, Any]:
         base_url = LLMService._effective_base_url()
-        provider = "llm-gateway" if LLMService._gateway_mode() else "ollama-direct"
+        configured = bool(base_url and LLMService._effective_model())
 
-        if not LLMService.ollama_configured():
+        if not configured:
             return {
                 "status": "error",
-                "provider": provider,
-                "url": base_url,
+                "provider": "ollama",
+                "configured": False,
+                "available": False,
                 "gateway_configured": False,
                 "gateway_ok": False,
             }
@@ -555,25 +564,27 @@ class LLMService:
                 if resp.status_code < 400:
                     return {
                         "status": "ok",
-                        "provider": provider,
-                        "url": base_url,
+                        "provider": "ollama",
+                        "configured": True,
+                        "available": True,
                         "gateway_configured": True,
                         "gateway_ok": True,
                     }
                 return {
                     "status": "error",
-                    "provider": provider,
-                    "url": base_url,
-                    "detail": f"HTTP {resp.status_code}",
+                    "provider": "ollama",
+                    "configured": True,
+                    "available": False,
                     "gateway_configured": True,
                     "gateway_ok": False,
                 }
         except (httpx.HTTPError, httpx.TimeoutException, RuntimeError) as exc:
+            del exc
             return {
                 "status": "error",
-                "provider": provider,
-                "url": base_url,
-                "detail": str(exc),
+                "provider": "ollama",
+                "configured": True,
+                "available": False,
                 "gateway_configured": True,
                 "gateway_ok": False,
             }

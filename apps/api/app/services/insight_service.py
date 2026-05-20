@@ -497,7 +497,7 @@ class InsightService:
             for mention in mentions[:50]
         ]
 
-        return {
+        snapshot = {
             "batch_id": context_id if context_type == "batch" else None,
             "search_id": context_id if context_type == "search" else None,
             "context_id": context_id,
@@ -525,13 +525,92 @@ class InsightService:
             "top_critical_terms": [term for term, _ in critical_terms_counter.most_common(10)],
         }
 
+        required_defaults = {
+            "batch_id": None,
+            "search_id": None,
+            "context_id": context_id,
+            "context_type": context_type,
+            "brand": "indefinida",
+            "query": "indefinida",
+            "period": "indefinido",
+            "date_range": {"start": None, "end": None},
+            "total_mentions": 0,
+            "total_comments": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "neutral_count": 0,
+            "sentiment_distribution": {},
+            "critical_mentions": 0,
+            "average_urgency": 0.0,
+            "top_themes": [],
+            "top_negative_texts": [],
+            "top_positive_texts": [],
+            "source_distribution": {},
+            "criticality_distribution": {},
+            "source_references": [],
+            "sample_mentions": [],
+            "top_aspects": [],
+            "top_critical_terms": [],
+        }
+        required_defaults.update(snapshot)
+        return required_defaults
+
+    @staticmethod
+    def _fallback_analysis_from_snapshot(snapshot: dict[str, Any], reason: str) -> dict[str, Any]:
+        distribution = snapshot.get("sentiment_distribution") if isinstance(snapshot.get("sentiment_distribution"), dict) else {}
+        negative_count = int(distribution.get("negativo", distribution.get("negative", 0)) or 0)
+        total_comments = int(snapshot.get("total_comments", snapshot.get("total_mentions", 0)) or 0)
+        average_urgency = float(snapshot.get("average_urgency", 0) or 0)
+
+        if total_comments > 0:
+            negative_ratio = negative_count / total_comments
+        else:
+            negative_ratio = 0.0
+
+        if average_urgency >= 0.7 or negative_ratio >= 0.45:
+            priority = "high"
+            trend = "worsening"
+        elif average_urgency >= 0.4 or negative_ratio >= 0.25:
+            priority = "medium"
+            trend = "stable"
+        else:
+            priority = "low"
+            trend = "improving"
+
+        top_terms = snapshot.get("top_critical_terms") if isinstance(snapshot.get("top_critical_terms"), list) else []
+        main_term = str(top_terms[0]) if top_terms else "insatisfacao recorrente"
+
+        return {
+            "executive_summary": f"Analise automatica indisponivel. Fallback aplicado: {reason}",
+            "sentiment_overview": (
+                f"Volume analisado: {total_comments}. "
+                f"Negativas: {negative_count}. "
+                f"Urgencia media: {round(average_urgency, 2)}."
+            ),
+            "priority": priority,
+            "risks": [f"Escalada de mencoes relacionadas a {main_term}"],
+            "opportunities": ["Atuar rapidamente nos temas criticos para reduzir detracao"],
+            "recommended_actions": [
+                "Priorizar tratativas de alto impacto",
+                "Responder mencoes criticas com SLA reduzido",
+            ],
+            "decision_guidance": "Aplicar plano tatico enquanto a analise de IA nao estiver disponivel.",
+            "trend": trend,
+            "source_references": snapshot.get("source_references") if isinstance(snapshot.get("source_references"), list) else [],
+            "resolution": "pending",
+            "llm_unavailable": True,
+            "fallback_used": True,
+        }
+
     @staticmethod
     def _build_operational_fields(snapshot: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
         total_comments = max(1, int(snapshot.get("total_comments", 0) or 0))
         average_urgency = float(snapshot.get("average_urgency", 0) or 0)
         critical_mentions = int(snapshot.get("critical_mentions", 0) or 0)
         sentiment_distribution = snapshot.get("sentiment_distribution") or {}
-        negative_mentions = int(sentiment_distribution.get("negativo", 0) or 0)
+        negative_mentions = int(
+            sentiment_distribution.get("negativo", sentiment_distribution.get("negative", 0)) or 0
+        )
 
         critical_ratio = min(1.0, critical_mentions / total_comments)
         negative_ratio = min(1.0, negative_mentions / total_comments)
@@ -621,7 +700,27 @@ class InsightService:
                     context_id=context_id,
                     context_type=context_type,
                 )
-                analysis = await LLMService.analyze_snapshot(snapshot=snapshot, user_id=user_id)
+                analysis_raw = await LLMService.analyze_snapshot(snapshot=snapshot, user_id=user_id)
+                if not isinstance(analysis_raw, dict):
+                    analysis_raw = {}
+
+                llm_unavailable = bool(analysis_raw.get("llm_unavailable"))
+                fallback_used = False
+                analysis_source = analysis_raw
+                if llm_unavailable:
+                    fallback_used = True
+                    analysis_source = InsightService._fallback_analysis_from_snapshot(
+                        snapshot=snapshot,
+                        reason=str(
+                            analysis_raw.get("executive_summary")
+                            or "IA indisponivel"
+                        ),
+                    )
+
+                analysis = LLMService.normalize_analysis(analysis_source)
+                analysis["llm_unavailable"] = llm_unavailable
+                analysis["fallback_used"] = fallback_used
+
                 processed_count_now = InsightService._context_mentions_count(
                     user_id=user_id,
                     context_type=context_type,
@@ -633,79 +732,48 @@ class InsightService:
                 audit_metadata = {
                     "generated_at": now.isoformat(),
                     "provider": settings.LLM_PROVIDER,
-                    "model": "managed-by-gateway",
+                    "model": str(getattr(settings, "LLM_MODEL_EFFECTIVE", "") or settings.OLLAMA_MODEL or ""),
                     "threshold": int(job.get("threshold") or InsightService.get_threshold(user_id=user_id)),
                     "processed_count_at_enqueue": int(job.get("processed_count_at_enqueue") or 0),
                     "processed_count_at_generation": processed_count_now,
                     "job_trigger": str(job.get("trigger") or "auto"),
                     "deterministic_rules_version": "priority-v1",
+                    "llm_unavailable": llm_unavailable,
+                    "fallback_used": fallback_used,
                 }
-                llm_unavailable = bool(analysis.get("llm_unavailable"))
-                if llm_unavailable:
-                    insight_doc = {
-                        "_id": insight_id,
-                        "insight_id": insight_id,
-                        "job_id": job_id,
-                        "user_id": user_id,
-                        "batch_id": context_id if context_type == "batch" else None,
-                        "search_id": context_id if context_type == "search" else None,
-                        "context_id": context_id,
-                        "context_type": context_type,
-                        "trigger": job.get("trigger", "auto"),
-                        "archived": False,
-                        "company": str(snapshot.get("brand") or "indefinida"),
-                        "priority": None,
-                        "urgency": None,
-                        "root_cause": None,
-                        "recommended_action": None,
-                        "status": "llm_unavailable",
-                        "resolution": "pending",
-                        "timestamp": utcnow().isoformat(),
-                        "priority_score": None,
-                        "source_references": snapshot.get("source_references", []),
-                        "source_distribution": snapshot.get("source_distribution", {}),
-                        "audit_metadata": audit_metadata,
-                        "snapshot": snapshot,
-                        "executive_summary": None,
-                        "sentiment_overview": None,
-                        "risks": None,
-                        "opportunities": None,
-                        "recommended_actions": None,
-                        "decision_guidance": None,
-                        "trend": None,
-                        "llm_payload": None,
-                        "created_at": now,
-                        "updated_at": now,
-                    }
-                else:
-                    operational_fields = InsightService._build_operational_fields(snapshot=snapshot, analysis=analysis)
-                    insight_doc = {
-                        "_id": insight_id,
-                        "insight_id": insight_id,
-                        "job_id": job_id,
-                        "user_id": user_id,
-                        "batch_id": context_id if context_type == "batch" else None,
-                        "search_id": context_id if context_type == "search" else None,
-                        "context_id": context_id,
-                        "context_type": context_type,
-                        "trigger": job.get("trigger", "auto"),
-                        "archived": False,
-                        **operational_fields,
-                        "source_references": snapshot.get("source_references", []),
-                        "source_distribution": snapshot.get("source_distribution", {}),
-                        "audit_metadata": audit_metadata,
-                        "snapshot": snapshot,
-                        "executive_summary": analysis.get("executive_summary"),
-                        "sentiment_overview": analysis.get("sentiment_overview"),
-                        "risks": analysis.get("risks", []),
-                        "opportunities": analysis.get("opportunities", []),
-                        "recommended_actions": analysis.get("recommended_actions", []),
-                        "decision_guidance": analysis.get("decision_guidance"),
-                        "trend": analysis.get("trend", "stable"),
-                        "llm_payload": analysis,
-                        "created_at": now,
-                        "updated_at": now,
-                    }
+                operational_fields = InsightService._build_operational_fields(snapshot=snapshot, analysis=analysis)
+                insight_doc = {
+                    "_id": insight_id,
+                    "insight_id": insight_id,
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "batch_id": context_id if context_type == "batch" else None,
+                    "search_id": context_id if context_type == "search" else None,
+                    "context_id": context_id,
+                    "context_type": context_type,
+                    "trigger": job.get("trigger", "auto"),
+                    "archived": False,
+                    **operational_fields,
+                    "source_references": snapshot.get("source_references", []),
+                    "source_distribution": snapshot.get("source_distribution", {}),
+                    "audit_metadata": audit_metadata,
+                    "snapshot": snapshot,
+                    "executive_summary": analysis.get("executive_summary") or "Analise indisponivel no momento.",
+                    "sentiment_overview": analysis.get("sentiment_overview") or "Resumo de sentimento indisponivel.",
+                    "risks": analysis.get("risks") if isinstance(analysis.get("risks"), list) else [],
+                    "opportunities": analysis.get("opportunities") if isinstance(analysis.get("opportunities"), list) else [],
+                    "recommended_actions": analysis.get("recommended_actions") if isinstance(analysis.get("recommended_actions"), list) else [],
+                    "decision_guidance": analysis.get("decision_guidance") or "Direcionamento indisponivel.",
+                    "trend": analysis.get("trend") or "stable",
+                    "llm_payload": {
+                        **analysis,
+                        "raw": analysis_raw,
+                    },
+                    "llm_unavailable": llm_unavailable,
+                    "fallback_used": fallback_used,
+                    "created_at": now,
+                    "updated_at": now,
+                }
                 db.insights.insert_one(insight_doc)
 
                 db.insight_jobs.update_one(

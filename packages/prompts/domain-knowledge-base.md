@@ -1,30 +1,9 @@
-# Base de Conhecimento do SentimentoIA
+# Base Factual do SentimentoIA
 
-## O que é o SentimentoIA
-SentimentoIA é um SaaS de análise de sentimentos e reputação de marca. O sistema coleta menções, processa sinais de sentimento e criticidade, gera insights acionáveis e apoia decisões operacionais e executivas.
+## Produto
+SentimentoIA e uma plataforma SaaS para monitorar reputacao de marca e analisar sentimento de mencoes.
 
-## Funcionalidades principais
-- Busca e coleta de menções em múltiplas fontes.
-- Dashboard com visão consolidada de indicadores.
-- Geração de insights com prioridade, riscos e oportunidades.
-- Chat contextual restrito ao domínio do produto.
-- Relatórios de exportação em CSV, PDF e Markdown.
-
-## Métricas de referência
-- total_comments: volume total de comentários analisados.
-- sentiment_score: score agregado de sentimento de 0 a 100.
-- positive, negative, neutral: distribuição de polaridade.
-- criticality: classificação de criticidade (ex.: low, medium, high).
-- top_themes: temas mais recorrentes.
-- alerts: alertas operacionais e analíticos.
-
-## Estrutura dos insights
-- priority: high, medium ou low.
-- resolution: pending, in-progress ou resolved.
-- executive_summary: síntese executiva objetiva.
-- recommended_actions: ações recomendadas para execução.
-
-## Fontes suportadas
+## Fontes de dados
 - Reddit
 - YouTube
 - App Store
@@ -32,10 +11,35 @@ SentimentoIA é um SaaS de análise de sentimentos e reputação de marca. O sis
 - Glassdoor
 - Trustpilot
 - Reclame Aqui
-- Web geral
+- Web aberta
 
-## Segurança e privacidade
-- Isolamento estrito por usuário autenticado.
-- Dados de um usuário não podem ser acessados por outro.
-- Conformidade LGPD com mecanismos de exportação e exclusão de dados.
-- Dados sensíveis devem ser filtrados e nunca expostos no chat.
+## Fluxo de analise
+1. Usuario executa busca por marca/tema.
+2. Sistema coleta e normaliza mencoes.
+3. Sistema calcula sinais de sentimento, criticidade e urgencia.
+4. Dashboard consolida metricas e distribuicoes.
+5. Insights priorizam riscos, oportunidades e acoes recomendadas.
+6. Chat responde apenas com contexto autorizado do proprio usuario.
+
+## Metricas principais
+- total_comments: volume total analisado.
+- sentiment_score: indicador agregado de sentimento.
+- sentiment_distribution: positivo, negativo e neutro.
+- criticality: nivel de criticidade (low, medium, high).
+- top_themes: temas recorrentes.
+- alerts: eventos relevantes para acompanhamento.
+
+## Estrutura de insight
+- executive_summary
+- sentiment_overview
+- priority (high|medium|low)
+- resolution (pending|in_progress|resolved)
+- risks
+- opportunities
+- recommended_actions
+- decision_guidance
+
+## Politica de isolamento por usuario
+- Todo dado de chat, busca, insight e relatorio e isolado por usuario autenticado.
+- O assistente so pode responder com dados do contexto autorizado do usuario atual.
+- Dados de outros usuarios nunca devem ser acessados, inferidos ou exibidos.

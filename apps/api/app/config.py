@@ -26,16 +26,12 @@ class Settings(BaseSettings):
     MONGODB_URI: str = "mongodb://localhost:27017"
     DATABASE_NAME: str = "sentimento_db"
 
-    # Removido: gateway externo. Conexao agora direta via OLLAMA_BASE_URL.
-    # LLM_PROVIDER foi mantido apenas para log/telemetria informativa.
-    LLM_PROVIDER: str = "ollama-direct"
+    # IA direta via Ollama (sem gateway legado).
+    LLM_PROVIDER: str = "ollama"
     OLLAMA_BASE_URL: str = ""
     OLLAMA_API_KEY: str = ""
-    OLLAMA_MODEL: str = "llama3.1:8b"
+    OLLAMA_MODEL: str = ""
     OLLAMA_TIMEOUT_SECONDS: int = 60
-    LLM_GATEWAY_BASE_URL: str = ""
-    LLM_GATEWAY_API_KEY: str = ""
-    LLM_GATEWAY_TIMEOUT_SECONDS: int = 60
 
     @property
     def OLLAMA_EFFECTIVE_URL(self) -> str:
@@ -48,20 +44,22 @@ class Settings(BaseSettings):
 
     @property
     def LLM_GATEWAY_EFFECTIVE_URL(self) -> str:
-        url = str(self.LLM_GATEWAY_BASE_URL or "").strip().rstrip("/")
-        if not url:
-            return ""
-        if url.lower().endswith("/api"):
-            return url
-        return f"{url}/api"
+        # Alias legado de compatibilidade: manter interface antiga sem usar gateway.
+        return self.OLLAMA_EFFECTIVE_URL
 
     @property
     def LLM_GATEWAY_EFFECTIVE_API_KEY(self) -> str:
-        return str(self.LLM_GATEWAY_API_KEY or "").strip()
+        # Alias legado de compatibilidade: API key passa a ser a do Ollama.
+        return str(self.OLLAMA_API_KEY or "").strip()
 
     @property
     def LLM_GATEWAY_TIMEOUT_SECONDS_EFFECTIVE(self) -> int:
-        return max(1, int(self.LLM_GATEWAY_TIMEOUT_SECONDS or self.OLLAMA_TIMEOUT_SECONDS or 60))
+        # Alias legado de compatibilidade: timeout passa a ser o do Ollama.
+        return max(1, int(self.OLLAMA_TIMEOUT_SECONDS or 60))
+
+    @property
+    def LLM_MODEL_EFFECTIVE(self) -> str:
+        return str(self.OLLAMA_MODEL or "").strip()
 
     # URL publica do frontend para links transacionais.
     FRONTEND_URL: str = "http://localhost:5173"

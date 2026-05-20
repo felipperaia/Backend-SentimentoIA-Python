@@ -19,12 +19,11 @@ class DashboardService:
         if db is None:
             raise RuntimeError("Banco de dados indisponivel")
 
-        # Busca por batch_id OU search_id (ambos os fluxos)
+        # Busca por batch_id OU search_id (ambos os fluxos).
         query: dict[str, Any] = {"user_id": user_id}
         if batch_id:
             query["$or"] = [{"batch_id": batch_id}, {"search_id": batch_id}]
         else:
-            # Aceita mencoes de qualquer fluxo
             query["$or"] = [
                 {"batch_id": {"$exists": True}, "status": "processed"},
                 {"search_id": {"$exists": True}},
@@ -49,7 +48,9 @@ class DashboardService:
                     "total_comments": 0,
                     "sentiment_distribution": {},
                     "source_distribution": {},
+                    "sources_distribution": {},
                     "top_aspects": {},
+                    "top_themes": {},
                     "critical_mentions": 0,
                     "average_urgency": 0,
                     "reputation_score": 0,
@@ -57,40 +58,85 @@ class DashboardService:
                 },
                 "mentions": [],
                 "latest_insight": None,
+                "alerts": [],
+                "errors": [],
+                "llm_analysis": None,
             }
 
         metrics = EnrichmentService.aggregate(mentions)
         metrics["total_comments"] = metrics.get("total_mentions", 0)
+        metrics.setdefault("sources_distribution", metrics.get("source_distribution", {}))
+        metrics.setdefault("top_themes", metrics.get("top_aspects", {}))
 
-        # Identifica batch/search ID do contexto
-        selected_batch_id = batch_id
-        if not selected_batch_id:
-            selected_batch_id = str(
+        # Identifica batch/search ID do contexto.
+        selected_context_id = batch_id
+        if not selected_context_id:
+            selected_context_id = str(
                 mentions[0].get("batch_id") or mentions[0].get("search_id") or ""
             )
 
-        # Busca insight mais recente
+        # Busca insight mais recente no mesmo contexto (batch/search/context_id).
         insight_query: dict[str, Any] = {"user_id": user_id, "archived": False}
-        if selected_batch_id:
-            insight_query["batch_id"] = selected_batch_id
+        if selected_context_id:
+            insight_query["$or"] = [
+                {"batch_id": selected_context_id},
+                {"search_id": selected_context_id},
+                {"context_id": selected_context_id},
+            ]
         latest_insight = db.insights.find_one(insight_query, sort=[("created_at", -1)])
 
-        # Se nao encontrou insight por batch_id, tenta buscar llm_analysis do search_job
+        # Se nao encontrou insight, tenta buscar llm_analysis do search_job.
         llm_analysis = None
-        if not latest_insight and selected_batch_id:
+        search_job = None
+        if selected_context_id:
             search_job = db.search_jobs.find_one(
-                {"user_id": user_id, "search_id": selected_batch_id, "status": "completed"},
-                {"llm_analysis": 1},
+                {"user_id": user_id, "search_id": selected_context_id, "status": "completed"},
+                {"llm_analysis": 1, "errors": 1},
             )
             if search_job and search_job.get("llm_analysis"):
                 llm_analysis = search_job["llm_analysis"]
 
+        # Fallback de latest_insight para manter contrato visual no frontend.
+        synthetic_latest_insight: dict[str, Any] | None = None
+        if not latest_insight and isinstance(llm_analysis, dict):
+            synthetic_latest_insight = {
+                "id": f"llm-fallback-{selected_context_id or 'latest'}",
+                "insight_id": f"llm-fallback-{selected_context_id or 'latest'}",
+                "context_id": selected_context_id,
+                "context_type": "search",
+                "priority": str(llm_analysis.get("priority") or "medium"),
+                "resolution": str(llm_analysis.get("resolution") or "pending"),
+                "trend": str(llm_analysis.get("trend") or metrics.get("trend") or "stable"),
+                "executive_summary": str(
+                    llm_analysis.get("executive_summary")
+                    or llm_analysis.get("sentiment_overview")
+                    or "Resumo indisponivel no momento"
+                ),
+                "recommended_actions": llm_analysis.get("recommended_actions")
+                if isinstance(llm_analysis.get("recommended_actions"), list)
+                else [],
+            }
+
+        alerts: list[dict[str, Any]] = []
+        if selected_context_id:
+            alerts = list(
+                db.alerts.find({"user_id": user_id, "search_id": selected_context_id}).sort("created_at", -1).limit(100)
+            )
+
+        errors = []
+        if isinstance(search_job, dict):
+            errors = search_job.get("errors") if isinstance(search_job.get("errors"), list) else []
+
         return {
-            "search_id": selected_batch_id or None,
-            "batch_id": selected_batch_id or None,
+            "search_id": selected_context_id or None,
+            "batch_id": selected_context_id or None,
             "metrics": metrics,
             "mentions": SearchService.serialize_many(mentions),
-            "latest_insight": SearchService.serialize(latest_insight) if latest_insight else None,
+            "latest_insight": SearchService.serialize(latest_insight)
+            if latest_insight
+            else synthetic_latest_insight,
+            "alerts": SearchService.serialize_many(alerts),
+            "errors": errors,
             "llm_analysis": llm_analysis,
         }
 
@@ -98,7 +144,7 @@ class DashboardService:
     def list_mentions(
         user_id: str,
         batch_id: str | None = None,
-        status: str = "processed",
+        status: str | None = None,
         sentiment: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -106,18 +152,30 @@ class DashboardService:
         if db is None:
             raise RuntimeError("Banco de dados indisponivel")
 
-        query: dict[str, Any] = {"user_id": user_id}
+        conditions: list[dict[str, Any]] = [{"user_id": user_id}]
         if batch_id:
-            query["$or"] = [{"batch_id": batch_id}, {"search_id": batch_id}]
+            conditions.append({"$or": [{"batch_id": batch_id}, {"search_id": batch_id}]})
         else:
-            query["$or"] = [
-                {"batch_id": {"$exists": True}},
-                {"search_id": {"$exists": True}},
-            ]
+            conditions.append(
+                {
+                    "$or": [
+                        {"batch_id": {"$exists": True}},
+                        {"search_id": {"$exists": True}},
+                    ]
+                }
+            )
+
         if status:
-            query["status"] = status
+            # Compatibilidade: mencoes de busca podem nao ter campo status.
+            if status == "processed":
+                conditions.append({"$or": [{"status": "processed"}, {"status": {"$exists": False}}]})
+            else:
+                conditions.append({"status": status})
+
         if sentiment:
-            query["sentiment"] = sentiment
+            conditions.append({"sentiment": sentiment})
+
+        query: dict[str, Any] = {"$and": conditions}
 
         mentions = list(
             db.mentions.find(query, {"raw": 0})
