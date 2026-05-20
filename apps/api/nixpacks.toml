@@ -17,8 +17,8 @@ cmds = [
 
 [phases.build]
 cmds = [
-  "python -m compileall app"
+  ". /opt/venv/bin/activate && python -m compileall app"
 ]
 
 [start]
-cmd = "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+cmd = ". /opt/venv/bin/activate && python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
