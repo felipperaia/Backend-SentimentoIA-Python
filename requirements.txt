@@ -1,23 +1,16 @@
-# Runtime
-fastapi>=0.104,<1.0
-uvicorn[standard]>=0.24,<1.0
-pydantic[email]>=2.5,<3
-pydantic-settings>=2.1,<3
-python-dotenv>=1.0,<2
-pymongo>=4.6,<5
-bcrypt>=4.1,<5
-python-jose>=3.3,<4
-pyotp>=2.9,<3
-qrcode[pil]>=7.4,<9
-httpx>=0.27,<1.0
-beautifulsoup4>=4.12,<5
-reportlab>=4.0,<5
-textblob>=0.18,<1
-
-# Scrapers (opcionais, mas incluídos)
-google-play-scraper>=1.2,<1.3
-playwright>=1.44,<2
-
-# Testes/desenvolvimento
-pytest>=8,<10
-mongomock>=4.3,<5
+fastapi>=0.111.0,<0.112
+uvicorn[standard]>=0.29.0,<0.30
+pydantic>=2.7.0,<3
+pydantic-settings>=2.2.0,<3
+pymongo>=4.7.0,<5
+python-jose[cryptography]>=3.3.0,<4
+passlib[bcrypt]>=1.7.4,<2
+pyotp>=2.9.0,<3
+httpx>=0.27.0,<0.28
+beautifulsoup4>=4.12.0,<5
+lxml>=5.2.0,<6
+qrcode[pil]>=7.4.2,<8
+Pillow>=10.3.0,<11
+python-multipart>=0.0.9,<0.1
+aiosmtplib>=3.0.0,<4
+google-play-scraper>=1.2.4

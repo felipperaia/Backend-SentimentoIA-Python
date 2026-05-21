@@ -71,22 +71,25 @@ def test_reddit_collector_usa_json_publico(monkeypatch) -> None:
         collector,
         "_request",
         AsyncMock(
-            return_value={
-                "data": {
-                    "children": [
-                        {
-                            "data": {
-                                "title": "SentimentoIA reclama",
-                                "selftext": "SentimentoIA com instabilidade",
-                                "permalink": "/r/test/comments/abc/sentimentoia/",
-                                "author": "user1",
-                                "created_utc": 1716200000,
-                                "score": 10,
+            return_value=(
+                {
+                    "data": {
+                        "children": [
+                            {
+                                "data": {
+                                    "title": "SentimentoIA reclama",
+                                    "selftext": "SentimentoIA com instabilidade",
+                                    "permalink": "/r/test/comments/abc/sentimentoia/",
+                                    "author": "user1",
+                                    "created_utc": 1716200000,
+                                    "score": 10,
+                                }
                             }
-                        }
-                    ]
-                }
-            }
+                        ]
+                    }
+                },
+                {"X-Ratelimit-Remaining": "59"},
+            )
         ),
     )
 

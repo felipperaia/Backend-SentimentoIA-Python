@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
 
 API_ROOT = Path(__file__).resolve().parents[1]
@@ -19,8 +21,26 @@ from app.main import app
 from app.database import MongoDB
 
 
+def _mongodb_available(mongodb_uri: str) -> bool:
+    try:
+        mongo_client = MongoClient(
+            mongodb_uri,
+            serverSelectionTimeoutMS=1500,
+            connectTimeoutMS=1500,
+        )
+        mongo_client.admin.command("ping")
+        mongo_client.close()
+        return True
+    except (PyMongoError, ValueError, TypeError):
+        return False
+
+
 @pytest.fixture(scope="session")
 def client():
+    mongodb_uri = os.getenv("MONGODB_URI", "").strip()
+    if not mongodb_uri or not _mongodb_available(mongodb_uri):
+        pytest.skip("MongoDB indisponivel para testes de integracao (fixture client)")
+
     with TestClient(app) as test_client:
         yield test_client
 

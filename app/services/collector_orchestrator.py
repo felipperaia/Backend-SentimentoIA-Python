@@ -123,7 +123,7 @@ class CollectorOrchestrator:
 
         results: dict[str, list[dict[str, Any]]] = {}
 
-        inter_source_delay = max(0.0, float(getattr(settings, "SCRAPER_DELAY_SECONDS", 5.0) or 0.0))
+        inter_source_delay = max(0.0, float(settings.scraper_request_delay_seconds or 1.0))
 
         for index, source_name in enumerate(selected_sources):
             if source_name not in collectors_map:

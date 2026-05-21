@@ -17,7 +17,7 @@ from app.api.mentions_router import router as mentions_router
 from app.api.reports_router import router as reports_router
 from app.auth_utils import get_current_user
 from app.config import settings
-from app.database import MongoDB, get_db
+from app.database import connect_db, disconnect_db, get_db
 from app.models import ScrapeRequest, SearchRequest
 from app.schemas import ChatMessageCreateRequest, ChatThreadCreateRequest, UserSettingsUpdateRequest
 from app.services.chat_service import ChatService, ChatUnavailableError
@@ -32,7 +32,7 @@ from app.services.scraper_service import ScraperService
 from app.services.search_service import SearchService
 from app.services.source_registry_service import SourceRegistryService
 
-logging.basicConfig(level=settings.LOG_LEVEL)
+logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
 
 
@@ -195,8 +195,9 @@ async def auto_refresh_loop() -> None:
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
-    await MongoDB.connect_db()
+async def lifespan(app: FastAPI):
+    del app
+    await connect_db()
     SourceRegistryService.sync_defaults_to_db()
 
     try:
@@ -205,7 +206,7 @@ async def lifespan(_app: FastAPI):
         logger.warning(f"Ollama não acessível. Funcionalidades de IA desabilitadas: {exc}")
 
     task = None
-    if settings.AUTO_REFRESH_ENABLED:
+    if settings.auto_refresh_enabled:
         task = asyncio.create_task(auto_refresh_loop())
 
     try:
@@ -213,29 +214,20 @@ async def lifespan(_app: FastAPI):
     finally:
         if task:
             task.cancel()
-        await MongoDB.close_db()
+        await disconnect_db()
 
 
 app = FastAPI(
     title="SentimentoIA API",
     description="Backend com coleta multi-fonte resiliente (Reddit, YouTube, App/Play Store e compatibilidade legada), Ollama Cloud e MongoDB.",
-    version="2.0.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
-effective_cors_origins = list(settings.CORS_ORIGINS_EFFECTIVE or [])
-if settings.IS_PRODUCTION and not effective_cors_origins:
-    logger.warning(
-        "Nenhuma origem CORS valida para producao. Defina FRONTEND_URL e/ou CORS_ORIGINS_CSV para evitar bloqueios."
-    )
-
-allow_origins = effective_cors_origins or ([] if settings.IS_PRODUCTION else ["*"])
-allow_credentials = bool(allow_origins and allow_origins != ["*"])
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=allow_credentials,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -285,15 +277,11 @@ async def global_exception_handler(request: Request, exc: Exception):
     request_id = uuid4().hex
     logger.exception("Erro nao tratado request_id=%s path=%s", request_id, request.url.path)
 
-    error_message = "Erro interno. Tente novamente em instantes."
-    if settings.PUBLIC_ERROR_VERBOSE:
-        error_message = f"Erro interno: {type(exc).__name__}"
-
     return JSONResponse(
         status_code=500,
         content={
             "ok": False,
-            "error": error_message,
+            "error": "Erro interno. Tente novamente em instantes.",
             "request_id": request_id,
         },
     )
@@ -302,7 +290,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/health")
 async def health():
     """Healthcheck simples para saber se o backend está ativo."""
-    return {"ok": True, "service": "SentimentoIA API", "version": "2.0.0"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 @app.get("/api/privacy/policy")
@@ -409,12 +397,12 @@ async def integrations_status():
     active_sources = SourceRegistryService.active_sources()
     return {
         "scraping_enabled": True,
-        "scraper_delay_seconds": settings.SCRAPER_DELAY_SECONDS,
-        "scraper_default_limit": settings.SCRAPER_DEFAULT_LIMIT,
+        "scraper_delay_seconds": settings.scraper_request_delay_seconds,
+        "scraper_default_limit": settings.scraper_default_limit,
         "scraper_default_sources": SourceRegistryService.default_sources(),
         "scraper_active_sources": active_sources,
         "scraper_source_metadata": SourceRegistryService.source_metadata(),
-        "mongodb_configured": bool(settings.MONGODB_URI),
+        "mongodb_configured": bool(settings.mongodb_uri),
         "llm": llm,
         "external_source_apis_removed": True,
     }
@@ -896,10 +884,6 @@ async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
 
     Uso apenas em desenvolvimento/testes.
     """
-    env_name = (settings.ENV or "").strip().lower()
-    if env_name in {"production", "prod", "release"} or not settings.ENABLE_DEV_CLEAR_DATA:
-        raise HTTPException(status_code=404, detail="Endpoint indisponivel")
-
     db = get_db()
     if db is None:
         raise HTTPException(status_code=503, detail="Banco de dados indisponivel")

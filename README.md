@@ -43,15 +43,12 @@ Responsabilidades deste backend:
 ## Estrutura de pastas
 
 ```text
+app/                      # codigo da API (entrypoint: app.main:app)
+tests/                    # testes da API
+.env.example              # template de configuracao
 apps/
-   api/
-      app/                # codigo da API (entrypoint: app.main:app)
-      tests/              # testes da API
-      .env.example        # template de configuracao
    worker/
       app/worker.py       # processo de worker
-packages/
-   prompts/              # prompts e base de conhecimento do dominio
 ```
 
 ## Pre-requisitos
@@ -70,8 +67,8 @@ Execute os comandos na raiz do repositorio.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r apps/api/requirements.txt
-Copy-Item apps/api/.env.example apps/api/.env
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
 ### Linux/macOS
@@ -80,8 +77,8 @@ Copy-Item apps/api/.env.example apps/api/.env
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r apps/api/requirements.txt
-cp apps/api/.env.example apps/api/.env
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
 Opcional (somente se habilitar coletores baseados em Playwright):
@@ -92,7 +89,7 @@ python -m playwright install
 
 ## Configuracao de ambiente
 
-O arquivo canonico de configuracao e `apps/api/.env` (utilizado pela API e pelo worker).
+O arquivo canonico de configuracao e `.env` na raiz (utilizado pela API e pelo worker).
 
 Variaveis essenciais:
 
@@ -114,17 +111,15 @@ Variaveis importantes para coleta em ambientes lentos:
 - `SCRAPER_TIMEOUT_SECONDS`
 - `SCRAPER_RETRY_ATTEMPTS`
 - `SCRAPER_RETRY_BACKOFF_SECONDS`
-- `SCRAPER_DELAY_SECONDS`
+- `SCRAPER_REQUEST_DELAY_SECONDS`
 
 Observacao de deploy:
 
 - em producao, `OLLAMA_BASE_URL` deve apontar para endpoint remoto valido (sem `localhost`)
-- se `OLLAMA_BASE_URL` estiver em `localhost/127.0.0.1` com `ENV=production`, a integracao de IA e ignorada por seguranca
 
 Variaveis importantes para worker:
 
-- `WORKER_POLL_INTERVAL_SECONDS`
-- `WORKER_BATCH_SIZE`
+- `BATCH_SIZE`
 - `LLM_TRIGGER_MIN_COMMENTS`
 - `LLM_MAX_SAMPLE_MENTIONS`
 
@@ -133,7 +128,7 @@ Variaveis importantes para worker:
 ### 1) API
 
 ```bash
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir apps/api --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ### 2) Worker (novo terminal, na raiz)
@@ -144,7 +139,7 @@ python -m apps.worker.app.worker
 
 Observacao:
 
-- o worker carrega automaticamente o mesmo `apps/api/.env`
+- o worker carrega automaticamente o mesmo `.env` da raiz
 - entrypoint recomendado da API: `app.main:app`
 - `app.main_real:app` e legado e nao deve ser usado como padrao
 
@@ -246,13 +241,13 @@ Comportamento de indisponibilidade da IA:
 Com ambiente virtual ativo, execute na raiz do repositorio:
 
 ```bash
-python -m pytest apps/api/tests -q
+python -m pytest tests -q
 ```
 
 Exemplo de execucao focada:
 
 ```bash
-python -m pytest apps/api/tests/test_main_flow.py apps/api/tests/test_scrape.py -q
+python -m pytest tests/test_main_flow.py tests/test_scrape.py -q
 ```
 
 Observacao:
@@ -266,7 +261,7 @@ Comandos de start recomendados:
 - API:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir apps/api
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
 - Worker:
@@ -279,18 +274,16 @@ python -m apps.worker.app.worker
 
 Configurar o servico da API com:
 
-- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir apps/api`
+- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Working directory: raiz do repositorio `backend-api-python`
 
 Configurar o worker como servico separado com:
 
 - Start command: `python -m apps.worker.app.worker`
-- Mesmo arquivo de ambiente da API (`apps/api/.env`)
+- Mesmo arquivo de ambiente da API (`.env`)
 
 Checklist minimo de producao:
 
-- `ENV=production`
-- `DEBUG=false`
 - `SECRET_KEY` forte e secreta
 - `MONGODB_URI` de producao
 - `FRONTEND_URL` publica
@@ -300,12 +293,12 @@ Checklist minimo de producao:
 ## Troubleshooting
 
 - Erro `ModuleNotFoundError: app`:
-   - execute a API com `--app-dir apps/api`
+   - execute os comandos na raiz do repositorio
 - Erro de CORS:
    - valide `FRONTEND_URL` e `CORS_ORIGINS_CSV`
 - API sem recursos de IA:
    - valide `OLLAMA_BASE_URL` e timeout de rede
 - Worker nao processa fila:
-   - confirme conexao com MongoDB e valores de `WORKER_*`
+   - confirme conexao com MongoDB e valor de `BATCH_SIZE`
 - Falha em exportacoes:
    - confirme autenticacao JWT e existencia de dados do usuario

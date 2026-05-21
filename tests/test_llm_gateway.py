@@ -2,7 +2,6 @@ import asyncio
 import json
 
 import httpx
-import pytest
 
 from app.config import settings
 from app.services.llm_service import LLMService
@@ -25,9 +24,10 @@ def _configure_gateway(
     base_url: str = "https://gateway.example.com",
     api_key: str = "gateway-key",
 ) -> None:
-    monkeypatch.setattr(settings, "LLM_GATEWAY_BASE_URL", base_url, raising=False)
-    monkeypatch.setattr(settings, "LLM_GATEWAY_API_KEY", api_key, raising=False)
-    monkeypatch.setattr(settings, "LLM_GATEWAY_TIMEOUT_SECONDS", 20, raising=False)
+    monkeypatch.setattr(settings, "ollama_base_url", base_url)
+    monkeypatch.setattr(settings, "ollama_api_key", api_key)
+    monkeypatch.setattr(settings, "ollama_timeout_seconds", 20)
+    monkeypatch.setattr(settings, "ollama_model", "llama3")
 
 
 def _install_fake_async_client(monkeypatch, *, post_handler=None, get_handler=None):
@@ -64,8 +64,9 @@ def test_analyze_snapshot_uses_gateway_generate(monkeypatch):
 
     def _post_handler(url, headers, payload):
         del headers
-        assert url.endswith("/api/generate")
-        assert "model" not in payload
+        assert url.endswith("/api/chat")
+        assert payload["model"] == "llama3"
+        assert isinstance(payload.get("messages"), list)
         return _FakeResponse(
             url=url,
             payload={
@@ -90,7 +91,7 @@ def test_analyze_snapshot_uses_gateway_generate(monkeypatch):
     )
 
     assert calls
-    assert calls[0]["url"].endswith("/api/generate")
+    assert calls[0]["url"].endswith("/api/chat")
     assert result["executive_summary"] == "Insight gerado via gateway"
 
 
@@ -148,22 +149,37 @@ def test_healthcheck_uses_gateway_tags(monkeypatch):
     assert any(call["method"] == "GET" and call["url"].endswith("/api/tags") for call in calls)
 
 
-def test_gateway_auth_error_401():
-    response = _FakeResponse(url="https://gateway.example.com/api/chat", status_code=401, text="Unauthorized")
-    with pytest.raises(RuntimeError, match="autenticacao falhou"):
-        LLMService._handle_gateway_error(response)
+def test_gateway_auth_error_401_returns_none(monkeypatch):
+    _configure_gateway(monkeypatch)
+    _install_fake_async_client(
+        monkeypatch,
+        post_handler=lambda url, _headers, _payload: _FakeResponse(url=url, status_code=401, text="Unauthorized"),
+    )
+
+    result = asyncio.run(LLMService._post_json("chat", {"model": "llama3", "messages": []}))
+    assert result is None
 
 
-def test_gateway_rate_limit_429():
-    response = _FakeResponse(url="https://gateway.example.com/api/generate", status_code=429, text="Rate limited")
-    with pytest.raises(RuntimeError, match="limite de requisicoes"):
-        LLMService._handle_gateway_error(response)
+def test_gateway_rate_limit_429_returns_none(monkeypatch):
+    _configure_gateway(monkeypatch)
+    _install_fake_async_client(
+        monkeypatch,
+        post_handler=lambda url, _headers, _payload: _FakeResponse(url=url, status_code=429, text="Rate limited"),
+    )
+
+    result = asyncio.run(LLMService._post_json("generate", {"model": "llama3", "prompt": "oi"}))
+    assert result is None
 
 
-def test_gateway_upstream_5xx():
-    response = _FakeResponse(url="https://gateway.example.com/api/generate", status_code=503, text="Service unavailable")
-    with pytest.raises(RuntimeError, match="erro no upstream"):
-        LLMService._handle_gateway_error(response)
+def test_gateway_upstream_5xx_returns_none(monkeypatch):
+    _configure_gateway(monkeypatch)
+    _install_fake_async_client(
+        monkeypatch,
+        post_handler=lambda url, _headers, _payload: _FakeResponse(url=url, status_code=503, text="Service unavailable"),
+    )
+
+    result = asyncio.run(LLMService._post_json("generate", {"model": "llama3", "prompt": "oi"}))
+    assert result is None
 
 
 def test_analyze_snapshot_timeout_returns_safe_fallback(monkeypatch):
@@ -173,7 +189,7 @@ def test_analyze_snapshot_timeout_returns_safe_fallback(monkeypatch):
         del prompt, model
         raise httpx.TimeoutException("timeout")
 
-    monkeypatch.setattr(LLMService, "_call_ollama", staticmethod(_raise_timeout))
+    monkeypatch.setattr(LLMService, "_call_ollama_text", staticmethod(_raise_timeout))
 
     result = asyncio.run(LLMService.analyze_snapshot({"total_comments": 2, "sample_mentions": []}))
 
@@ -187,7 +203,7 @@ def test_analyze_snapshot_auth_error_returns_safe_fallback(monkeypatch):
         del prompt, model
         raise RuntimeError("Gateway LLM: autenticacao falhou (401)")
 
-    monkeypatch.setattr(LLMService, "_call_ollama", staticmethod(_raise_auth))
+    monkeypatch.setattr(LLMService, "_call_ollama_text", staticmethod(_raise_auth))
 
     result = asyncio.run(LLMService.analyze_snapshot({"total_comments": 1}))
 

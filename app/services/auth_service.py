@@ -383,7 +383,7 @@ class AuthService:
 
         raw_token = secrets.token_urlsafe(48)
         token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-        expires_at = AuthService.utcnow() + timedelta(minutes=max(5, int(settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)))
+        expires_at = AuthService.utcnow() + timedelta(minutes=max(5, int(settings.access_token_expire_minutes)))
 
         db = get_db()
         db.users.update_one(

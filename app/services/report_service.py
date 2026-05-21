@@ -4,16 +4,33 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi.responses import Response, StreamingResponse
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app.database import get_db
 
 
 class ReportService:
     """Exportação real CSV/PDF baseada no MongoDB, compatível com search_id e batch_id."""
+
+    @staticmethod
+    def _load_reportlab_components() -> dict[str, Any] | None:
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+        except ModuleNotFoundError:
+            return None
+
+        return {
+            "colors": colors,
+            "A4": A4,
+            "getSampleStyleSheet": getSampleStyleSheet,
+            "Paragraph": Paragraph,
+            "SimpleDocTemplate": SimpleDocTemplate,
+            "Spacer": Spacer,
+            "Table": Table,
+            "TableStyle": TableStyle,
+        }
 
     @staticmethod
     def _load_mentions(db, user_id: str, search_id: str) -> list[dict[str, Any]]:
@@ -106,6 +123,23 @@ class ReportService:
 
     @staticmethod
     def export_pdf(user_id: str, search_id: str) -> Response:
+        reportlab = ReportService._load_reportlab_components()
+        if reportlab is None:
+            return Response(
+                content="Exportacao PDF indisponivel neste ambiente (dependencia reportlab ausente).",
+                media_type="text/plain",
+                status_code=503,
+            )
+
+        colors = reportlab["colors"]
+        A4 = reportlab["A4"]
+        getSampleStyleSheet = reportlab["getSampleStyleSheet"]
+        Paragraph = reportlab["Paragraph"]
+        SimpleDocTemplate = reportlab["SimpleDocTemplate"]
+        Spacer = reportlab["Spacer"]
+        Table = reportlab["Table"]
+        TableStyle = reportlab["TableStyle"]
+
         db = get_db()
         mentions = ReportService._load_mentions(db, user_id, search_id)
         analysis_data = ReportService._load_analysis(db, user_id, search_id)
@@ -312,6 +346,23 @@ class ReportService:
         resolution: str | None = None,
         limit: int = 100,
     ) -> Response:
+        reportlab = ReportService._load_reportlab_components()
+        if reportlab is None:
+            return Response(
+                content="Exportacao PDF indisponivel neste ambiente (dependencia reportlab ausente).",
+                media_type="text/plain",
+                status_code=503,
+            )
+
+        colors = reportlab["colors"]
+        A4 = reportlab["A4"]
+        getSampleStyleSheet = reportlab["getSampleStyleSheet"]
+        Paragraph = reportlab["Paragraph"]
+        SimpleDocTemplate = reportlab["SimpleDocTemplate"]
+        Spacer = reportlab["Spacer"]
+        Table = reportlab["Table"]
+        TableStyle = reportlab["TableStyle"]
+
         db = get_db()
         insights = ReportService._load_insights(
             db=db,

@@ -739,7 +739,7 @@ class InsightService:
                 insight_id = f"insight_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
                 audit_metadata = {
                     "generated_at": now.isoformat(),
-                    "provider": settings.LLM_PROVIDER,
+                    "provider": "ollama",
                     "model": str(getattr(settings, "LLM_MODEL_EFFECTIVE", "") or settings.OLLAMA_MODEL or ""),
                     "threshold": int(job.get("threshold") or InsightService.get_threshold(user_id=user_id)),
                     "processed_count_at_enqueue": int(job.get("processed_count_at_enqueue") or 0),

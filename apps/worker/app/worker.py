@@ -4,17 +4,10 @@ import signal
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-# Load canonical API env file before importing backend settings.
+# Allow importing the official backend package from repository root.
 ROOT_DIR = Path(__file__).resolve().parents[3]
-API_ENV_FILE = ROOT_DIR / "apps" / "api" / ".env"
-load_dotenv(API_ENV_FILE, override=False)
-
-# Allow importing the official backend package (apps/api/app/*).
-API_PATH = ROOT_DIR / "apps" / "api"
-if str(API_PATH) not in sys.path:
-    sys.path.insert(0, str(API_PATH))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from app.config import settings
 from app.database import MongoDB, get_db
@@ -24,7 +17,7 @@ from app.services.processing_service import ProcessingService
 from app.services.source_registry_service import SourceRegistryService
 
 
-logging.basicConfig(level=settings.LOG_LEVEL)
+logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
 _is_running = True
 
@@ -36,8 +29,8 @@ def _stop_signal_handler(signum, frame):
 
 
 async def run_worker() -> None:
-    poll_interval = max(1, int(settings.WORKER_POLL_INTERVAL_SECONDS))
-    batch_size = max(1, int(settings.WORKER_BATCH_SIZE))
+    poll_interval = 5
+    batch_size = max(1, int(settings.batch_size))
 
     logger.info("Worker iniciado. poll_interval=%ss batch_size=%s", poll_interval, batch_size)
 

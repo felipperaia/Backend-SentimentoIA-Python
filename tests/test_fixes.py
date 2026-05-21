@@ -31,35 +31,30 @@ class TestOllamaURLConstruction:
         assert configured_url == "https://ollama.com"
 
     def test_build_ollama_url_generates_correct_endpoint(self):
-        """Verifica que _build_ollama_url monta /api/generate corretamente."""
+        """Verifica normalizacao de base URL para o endpoint /api."""
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local"
-            url = LLMService._build_ollama_url("generate")
-            assert url == "https://gateway.local/api/generate"
-            assert "/api/api/" not in url
+            mock_settings.ollama_base_url = "https://gateway.local"
+            assert LLMService._base_url() == "https://gateway.local/api"
 
     def test_build_ollama_url_no_double_slash(self):
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local/"
-            url = LLMService._build_ollama_url("generate")
-            assert "//api" not in url
+            mock_settings.ollama_base_url = "https://gateway.local/"
+            assert LLMService._base_url() == "https://gateway.local/api"
 
     def test_ollama_configured_requires_key(self):
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local"
-            mock_settings.LLM_MODEL_EFFECTIVE = "llama3.1:8b"
-            mock_settings.LLM_GATEWAY_EFFECTIVE_API_KEY = ""
+            mock_settings.ollama_base_url = "https://gateway.local"
+            mock_settings.ollama_model = ""
             assert LLMService.ollama_configured() is False
 
     def test_ollama_configured_with_key(self):
         from app.services.llm_service import LLMService
         with patch("app.services.llm_service.settings") as mock_settings:
-            mock_settings.LLM_GATEWAY_EFFECTIVE_URL = "https://gateway.local"
-            mock_settings.LLM_MODEL_EFFECTIVE = "llama3.1:8b"
-            mock_settings.LLM_GATEWAY_EFFECTIVE_API_KEY = "test-key-123"
+            mock_settings.ollama_base_url = "https://gateway.local"
+            mock_settings.ollama_model = "llama3.1:8b"
             assert LLMService.ollama_configured() is True
 
 
@@ -164,34 +159,38 @@ class TestNpsService:
 
 
 class TestLLMErrorHandling:
-    """Verifica tratamento de erros HTTP do Ollama."""
+    """Verifica fallback seguro quando a LLM falha."""
 
-    def test_401_error_message(self):
+    def test_timeout_returns_safe_fallback(self):
         from app.services.llm_service import LLMService
         import httpx
-        mock_resp = MagicMock(spec=httpx.Response)
-        mock_resp.status_code = 401
-        mock_resp.text = "Unauthorized"
-        mock_resp.url = "https://ollama.com/api/generate"
+        with patch.object(LLMService, "ollama_configured", return_value=True):
+            with patch.object(
+                LLMService,
+                "_call_ollama_text",
+                side_effect=httpx.TimeoutException("timeout"),
+            ):
+                result = asyncio.run(LLMService.analyze_snapshot({"total_comments": 3}))
+                assert "Falha temporaria na LLM" in result["executive_summary"]
 
-        with pytest.raises(RuntimeError, match="autenticacao falhou"):
-            LLMService._handle_ollama_error(mock_resp)
-
-    def test_429_error_message(self):
+    def test_runtime_error_returns_safe_fallback(self):
         from app.services.llm_service import LLMService
-        import httpx
-        mock_resp = MagicMock(spec=httpx.Response)
-        mock_resp.status_code = 429
-        mock_resp.text = "Rate limited"
-        mock_resp.url = "https://ollama.com/api/generate"
+        with patch.object(LLMService, "ollama_configured", return_value=True):
+            with patch.object(
+                LLMService,
+                "_call_ollama_text",
+                side_effect=RuntimeError("Gateway LLM: autenticacao falhou (401)"),
+            ):
+                result = asyncio.run(LLMService.analyze_snapshot({"total_comments": 1}))
+                assert "Falha temporaria na LLM" in result["executive_summary"]
 
-        with pytest.raises(RuntimeError, match="limite de requisicoes"):
-            LLMService._handle_ollama_error(mock_resp)
-
-    def test_200_no_error(self):
+    def test_successful_payload_returns_normalized_analysis(self):
         from app.services.llm_service import LLMService
-        import httpx
-        mock_resp = MagicMock(spec=httpx.Response)
-        mock_resp.status_code = 200
-        # Should not raise
-        LLMService._handle_ollama_error(mock_resp)
+        with patch.object(LLMService, "ollama_configured", return_value=True):
+            with patch.object(
+                LLMService,
+                "_call_ollama_text",
+                return_value='{"executive_summary":"ok","trend":"stable"}',
+            ):
+                result = asyncio.run(LLMService.analyze_snapshot({"total_comments": 1}))
+                assert result["executive_summary"] == "ok"

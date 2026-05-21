@@ -13,10 +13,10 @@ class EmailService:
 
     @staticmethod
     def smtp_configured() -> bool:
-        host = settings.SMTP_HOST.strip()
-        from_email = settings.SMTP_EFFECTIVE_FROM_EMAIL
-        username = settings.SMTP_EFFECTIVE_USERNAME
-        password = settings.SMTP_PASSWORD.strip()
+        host = settings.smtp_host.strip()
+        from_email = settings.smtp_from_email.strip()
+        username = settings.smtp_user.strip()
+        password = settings.smtp_password.strip()
 
         if (username and not password) or (password and not username):
             logger.warning("SMTP configurado parcialmente: usuario/senha inconsistentes")
@@ -65,10 +65,10 @@ class EmailService:
     @staticmethod
     def _send_via_smtp(*, to_email: str, subject: str, text_body: str, html_body: str) -> None:
         msg = EmailMessage()
-        from_name = settings.SMTP_FROM_NAME.strip()
-        from_email = settings.SMTP_EFFECTIVE_FROM_EMAIL
-        username = settings.SMTP_EFFECTIVE_USERNAME
-        password = settings.SMTP_PASSWORD.strip()
+        from_name = settings.smtp_from_name.strip()
+        from_email = settings.smtp_from_email.strip()
+        username = settings.smtp_user.strip()
+        password = settings.smtp_password.strip()
 
         if not from_email:
             raise ValueError("SMTP_FROM nao configurado")
@@ -79,16 +79,16 @@ class EmailService:
         msg.set_content(text_body)
         msg.add_alternative(html_body, subtype="html")
 
-        host = settings.SMTP_HOST.strip()
-        port = int(settings.SMTP_PORT)
+        host = settings.smtp_host.strip()
+        port = int(settings.smtp_port)
 
-        if settings.SMTP_USE_SSL:
+        if port == 465:
             smtp_client = smtplib.SMTP_SSL(host, port, timeout=15)
         else:
             smtp_client = smtplib.SMTP(host, port, timeout=15)
 
         with smtp_client as server:
-            if not settings.SMTP_USE_SSL and settings.SMTP_USE_TLS:
+            if port != 465:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()

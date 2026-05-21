@@ -21,46 +21,11 @@ class MongoDB:
 
     @classmethod
     async def connect_db(cls):
-        """Conecta no MongoDB Atlas/local e cria índices."""
-        try:
-            cls.client = MongoClient(
-                settings.MONGODB_URI,
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=10000,
-                retryWrites=True,
-                w="majority",
-            )
-            cls.client.admin.command("ping")
-            cls.db = cls.client[settings.DATABASE_NAME]
-
-            logger.info("✓ Conectado ao MongoDB com sucesso")
-            await cls.create_indexes()
-
-        except (ConnectionFailure, ServerSelectionTimeoutError) as exc:
-            logger.error("✗ Erro ao conectar ao MongoDB: %s", exc)
-            # Se estiver em ambiente de desenvolvimento, tenta usar mongomock como
-            # fallback para permitir que a aplicação rode sem um servidor MongoDB
-            # local durante o desenvolvimento.
-            if getattr(settings, "ENV", "").lower() == "development":
-                try:
-                    import mongomock  # type: ignore
-
-                    logger.warning("! Usando mongomock como fallback (ENV=development)")
-                    cls.client = mongomock.MongoClient()
-                    cls.db = cls.client[settings.DATABASE_NAME]
-                    logger.info("✓ Conectado ao mongomock (fallback)")
-                    await cls.create_indexes()
-                    return
-                except Exception as mexc:
-                    logger.error("✗ Falha ao ativar mongomock fallback: %s", mexc)
-            raise
+        await connect_db()
 
     @classmethod
     async def close_db(cls):
-        """Fecha conexão MongoDB."""
-        if cls.client:
-            cls.client.close()
-            logger.info("✓ Conexão com MongoDB fechada")
+        await disconnect_db()
 
     @classmethod
     async def create_indexes(cls):
@@ -121,3 +86,38 @@ class MongoDB:
 def get_db():
     """Retorna instância ativa do MongoDB."""
     return MongoDB.db
+
+
+async def connect_db() -> None:
+    """Conecta no MongoDB e cria índices; falha deve impedir startup da API."""
+    mongodb_uri = str(settings.mongodb_uri or "").strip()
+    if not mongodb_uri:
+        error = "MONGODB_URI is not configured"
+        logger.error("MongoDB connection failed: %s", error)
+        raise RuntimeError(f"MongoDB connection failed: {error}")
+
+    try:
+        MongoDB.client = MongoClient(
+            mongodb_uri,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000,
+            retryWrites=True,
+            w="majority",
+        )
+        MongoDB.client.admin.command("ping")
+        MongoDB.db = MongoDB.client[settings.database_name]
+
+        logger.info("Conectado ao MongoDB com sucesso")
+        await MongoDB.create_indexes()
+    except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as exc:
+        logger.exception("MongoDB connection failed")
+        raise RuntimeError(f"MongoDB connection failed: {exc}") from exc
+
+
+async def disconnect_db() -> None:
+    """Fecha conexão ativa com MongoDB."""
+    if MongoDB.client:
+        MongoDB.client.close()
+        MongoDB.client = None
+        MongoDB.db = None
+        logger.info("Conexao com MongoDB fechada")

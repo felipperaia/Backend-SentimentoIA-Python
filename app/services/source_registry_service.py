@@ -41,8 +41,8 @@ class SourceRegistryService:
             "reclameaqui": SourceConfig(
                 name="reclameaqui",
                 source_type="reputation",
-                base_url=settings.SCRAPER_RECLAMEAQUI_URL.rstrip("/"),
-                active=bool(getattr(settings, "ENABLE_RECLAME_AQUI", False) or settings.ENABLE_RECLAMEAQUI),
+                base_url="https://www.reclameaqui.com.br",
+                active=bool(settings.enable_reclame_aqui),
                 priority=35,
                 fetch_mode="public_api_or_html",
                 rate_limit_per_minute=10,
@@ -51,7 +51,7 @@ class SourceRegistryService:
             "reddit": SourceConfig(
                 name="reddit",
                 source_type="community",
-                base_url=settings.SCRAPER_REDDIT_URL.rstrip("/"),
+                base_url="https://www.reddit.com",
                 active=True,
                 priority=100,
                 fetch_mode="public_json",
@@ -111,7 +111,7 @@ class SourceRegistryService:
             "mastodon": SourceConfig(
                 name="mastodon",
                 source_type="federated_social",
-                base_url=settings.SCRAPER_MASTODON_BASE_URL.rstrip("/"),
+                base_url="https://mastodon.social",
                 active=True,
                 priority=80,
                 fetch_mode="public_json",
@@ -122,7 +122,7 @@ class SourceRegistryService:
             "web": SourceConfig(
                 name="web",
                 source_type="open_web",
-                base_url=settings.SCRAPER_WEB_SEARCH_URL.rstrip("/"),
+                base_url="https://html.duckduckgo.com/html/",
                 active=True,
                 priority=50,
                 fetch_mode="ddg_then_bing",
@@ -161,23 +161,8 @@ class SourceRegistryService:
 
     @staticmethod
     def default_sources() -> list[str]:
-        configured = [
-            SourceRegistryService.normalize_source_name(item)
-            for item in str(settings.SCRAPER_DEFAULT_SOURCES or "").split(",")
-            if item.strip()
-        ]
-
         definitions = SourceRegistryService._definitions()
-        selected = [
-            source
-            for source in configured
-            if source in definitions and definitions[source].active
-        ]
-
-        if selected:
-            return selected
-
-        fallback = ["reddit", "youtube", "appstore", "playstore", "web", "mastodon"]
+        fallback = ["reddit", "youtube", "appstore", "playstore", "web", "mastodon", "reclameaqui"]
         return [source for source in fallback if source in definitions and definitions[source].active]
 
     @staticmethod
