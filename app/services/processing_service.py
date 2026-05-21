@@ -1,6 +1,7 @@
 from app.database import get_db
 from app.services.enrichment_service import EnrichmentService
 from app.services.insight_service import InsightService
+from app.services.llm_service import LLMService
 from app.services.normalization_service import utcnow
 
 
@@ -98,12 +99,35 @@ class ProcessingService:
                     raise ValueError("comentario sem texto valido")
 
                 enrichment = EnrichmentService.analyze_mention(text, mention.get("rating"))
+                llm_analysis = LLMService.analyze_single_mention_sync(text)
+
+                merged_aspects = list(enrichment.get("aspects") or [])
+                for aspect in (llm_analysis.get("aspect_sentiment") or {}).keys():
+                    if aspect not in merged_aspects:
+                        merged_aspects.append(aspect)
+
+                confidence_score = float(llm_analysis.get("confidence_score", enrichment.get("confidence", 0.55)) or 0.55)
+                urgency_score = float(llm_analysis.get("urgency_score", enrichment.get("urgency_score", 0.0)) or 0.0)
+                critical_terms = list(enrichment.get("critical_terms") or [])
+                for factor in llm_analysis.get("urgency_factors") or []:
+                    if factor not in critical_terms:
+                        critical_terms.append(factor)
 
                 db.mentions.update_one(
                     {"_id": mention["_id"]},
                     {
                         "$set": {
                             **enrichment,
+                            "sentiment": llm_analysis.get("sentiment", enrichment.get("sentiment", "neutro")),
+                            "confidence": round(confidence_score, 3),
+                            "confidence_score": round(confidence_score, 3),
+                            "urgency_score": round(urgency_score, 4),
+                            "critical_terms": critical_terms,
+                            "criticality": llm_analysis.get("criticality", enrichment.get("criticality", "baixa")),
+                            "aspects": merged_aspects,
+                            "aspect_sentiment": llm_analysis.get("aspect_sentiment") or {},
+                            "urgency_factors": llm_analysis.get("urgency_factors") or [],
+                            "summary": llm_analysis.get("summary") or "",
                             "status": "processed",
                             "llm_eligible": True,
                             "processed_at": utcnow(),

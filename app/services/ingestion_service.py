@@ -140,6 +140,10 @@ class IngestionService:
                     "tags": comment.tags,
                     "text_fingerprint": fingerprint,
                     "llm_eligible": False,
+                    "confidence_score": 0.0,
+                    "urgency_factors": [],
+                    "aspect_sentiment": {},
+                    "summary": "",
                     "archived": False,
                     "updated_at": now,
                 }

@@ -100,7 +100,11 @@ class EnrichmentService:
         sentiments = Counter(m.get("sentiment", "neutro") for m in mentions)
         sources = Counter(m.get("source", "unknown") for m in mentions)
         aspects = Counter(a for m in mentions for a in m.get("aspects", []))
-        critical = sum(1 for m in mentions if m.get("criticality") == "alta")
+        critical = sum(
+            1
+            for m in mentions
+            if str(m.get("criticality") or "").strip().lower() in {"alta", "high", "critical", "critica", "crítica"}
+        )
 
         avg_score = round(sum(float(m.get("reputation_score", 50)) for m in mentions) / total, 2) if total else 0
         avg_urgency = round(sum(float(m.get("urgency_score", 0)) for m in mentions) / total, 3) if total else 0

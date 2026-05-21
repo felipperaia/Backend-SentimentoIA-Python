@@ -6,7 +6,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from app.auth_utils import create_access_token, get_current_user
+from app.auth_utils import create_access_token, create_refresh_token, decode_refresh_token, get_current_user
 from app.config import settings
 from app.schemas import (
     ChangePasswordRequest,
@@ -17,7 +17,9 @@ from app.schemas import (
     PasswordReset,
     PasswordResetConfirm,
     PasswordResetResponse,
+    RefreshTokenRequest,
     TokenResponse,
+    TokenRefreshResponse,
     UserCreate,
     UserLogin,
     UserProfileUpdate,
@@ -31,6 +33,10 @@ router = APIRouter()
 CurrentUser = Annotated[dict, Depends(get_current_user)]
 
 MFA_INVALID_CODE_DETAIL = "Código MFA inválido"
+
+
+def _access_token_expires_in_seconds() -> int:
+    return int(settings.ACCESS_TOKEN_EXPIRE_MINUTES) * 60
 
 
 def resolve_login_mfa(user: dict, credentials: UserLogin, request: Request) -> JSONResponse | None:
@@ -101,7 +107,17 @@ async def register(user_data: UserCreate, request: Request):
             role=user.get("role", "user"),
             expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
         )
-        return TokenResponse(access_token=token, user=serialize_user(user))
+        refresh_token = create_refresh_token(
+            subject=str(user["_id"]),
+            role=user.get("role", "user"),
+            expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        )
+        return TokenResponse(
+            access_token=token,
+            refresh_token=refresh_token,
+            expires_in=_access_token_expires_in_seconds(),
+            user=serialize_user(user),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception as exc:
@@ -132,7 +148,44 @@ async def login(credentials: UserLogin, request: Request):
         role=user.get("role", "user"),
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    return TokenResponse(access_token=token, user=serialize_user(user))
+    refresh_token = create_refresh_token(
+        subject=user_id,
+        role=user.get("role", "user"),
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    return TokenResponse(
+        access_token=token,
+        refresh_token=refresh_token,
+        expires_in=_access_token_expires_in_seconds(),
+        user=serialize_user(user),
+    )
+
+
+@router.post("/refresh", response_model=TokenRefreshResponse)
+async def refresh_token(payload: RefreshTokenRequest):
+    decoded = decode_refresh_token(payload.refresh_token)
+    user_id = str(decoded["sub"])
+
+    user = AuthService.get_user_by_id(user_id)
+    if not user or not user.get("is_active", True):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuário inativo ou inexistente")
+
+    access_token = create_access_token(
+        subject=user_id,
+        role=user.get("role", "user"),
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    new_refresh_token = create_refresh_token(
+        subject=user_id,
+        role=user.get("role", "user"),
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+    return TokenRefreshResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        expires_in=_access_token_expires_in_seconds(),
+    )
 
 
 @router.get("/me", response_model=UserResponse)

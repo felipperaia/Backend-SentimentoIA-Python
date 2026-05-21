@@ -70,6 +70,25 @@ class Settings(BaseSettings):
     batch_size: int = 50
     max_text_length: int = 5000
 
+    # Urgency thresholds and linguistic patterns
+    urgency_threshold_critical: float = 0.80
+    urgency_threshold_high: float = 0.60
+    urgency_threshold_medium: float = 0.35
+    urgency_patterns_critical: str = (
+        "cancelamento|processo judicial|procon|fraude|golpe|"
+        "advogado|acao legal|estorno forcado|chargeback"
+    )
+    urgency_patterns_high: str = (
+        "nunca mais|horrivel|absurdo|cade meu dinheiro|nao funciona|"
+        "terceira vez|problema recorrente|sem resposta|ignorado"
+    )
+    urgency_patterns_medium: str = "insatisfeito|demora|atraso|decepcionado|esperava mais|ruim|poderia melhorar"
+
+    # Rate limiting (requests per minute)
+    rate_limit_search_per_minute: int = 5
+    rate_limit_scrape_per_minute: int = 3
+    rate_limit_analyze_per_minute: int = 10
+
     # NPS
     nps_enabled: bool = True
     nps_cooldown_days: int = 30
@@ -115,6 +134,9 @@ class Settings(BaseSettings):
         "OLLAMA_MODEL": "ollama_model",
         "OLLAMA_TIMEOUT_SECONDS": "ollama_timeout_seconds",
         "PRIVACY_CONTACT_EMAIL": "privacy_contact_email",
+        "RATE_LIMIT_ANALYZE_PER_MINUTE": "rate_limit_analyze_per_minute",
+        "RATE_LIMIT_SCRAPE_PER_MINUTE": "rate_limit_scrape_per_minute",
+        "RATE_LIMIT_SEARCH_PER_MINUTE": "rate_limit_search_per_minute",
         "REFRESH_TOKEN_EXPIRE_DAYS": "refresh_token_expire_days",
         "SCRAPER_DEFAULT_LIMIT": "scraper_default_limit",
         "SCRAPER_DELAY_SECONDS": "scraper_request_delay_seconds",
@@ -134,6 +156,12 @@ class Settings(BaseSettings):
         "SMTP_PASSWORD": "smtp_password",
         "SMTP_PORT": "smtp_port",
         "SMTP_USER": "smtp_user",
+        "URGENCY_PATTERNS_CRITICAL": "urgency_patterns_critical",
+        "URGENCY_PATTERNS_HIGH": "urgency_patterns_high",
+        "URGENCY_PATTERNS_MEDIUM": "urgency_patterns_medium",
+        "URGENCY_THRESHOLD_CRITICAL": "urgency_threshold_critical",
+        "URGENCY_THRESHOLD_HIGH": "urgency_threshold_high",
+        "URGENCY_THRESHOLD_MEDIUM": "urgency_threshold_medium",
     }
 
     def __getattr__(self, name: str):

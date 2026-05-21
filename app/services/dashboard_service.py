@@ -1,4 +1,5 @@
 from datetime import timedelta
+from collections import Counter
 from typing import Any
 
 from app.database import get_db
@@ -8,6 +9,85 @@ from app.services.search_service import SearchService
 
 
 class DashboardService:
+    @staticmethod
+    def _normalize_negative_sentiment(value: Any) -> bool:
+        raw = str(value or "").strip().lower()
+        return raw in {"negativo", "negative"}
+
+    @staticmethod
+    def _compute_urgency_trend(db: Any, query: dict[str, Any]) -> list[dict[str, Any]]:
+        trend_query: dict[str, Any] = {"$and": [query, {"created_at": {"$type": "date"}}]}
+        pipeline = [
+            {"$match": trend_query},
+            {
+                "$project": {
+                    "day": {
+                        "$dateToString": {
+                            "format": "%Y-%m-%d",
+                            "date": "$created_at",
+                        }
+                    },
+                    "urgency_score": {"$ifNull": ["$urgency_score", 0]},
+                    "criticality_normalized": {
+                        "$toLower": {"$ifNull": ["$criticality", ""]}
+                    },
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$day",
+                    "avg_urgency": {"$avg": "$urgency_score"},
+                    "critical_count": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$in": [
+                                        "$criticality_normalized",
+                                        ["crítica", "critica", "critical"],
+                                    ]
+                                },
+                                1,
+                                0,
+                            ]
+                        }
+                    },
+                }
+            },
+            {"$sort": {"_id": 1}},
+        ]
+
+        items = list(db.mentions.aggregate(pipeline))
+        return [
+            {
+                "date": str(item.get("_id") or ""),
+                "avg_urgency": round(float(item.get("avg_urgency") or 0.0), 4),
+                "critical_count": int(item.get("critical_count") or 0),
+            }
+            for item in items
+            if str(item.get("_id") or "").strip()
+        ]
+
+    @staticmethod
+    def _compute_top_negative_aspects(db: Any, query: dict[str, Any]) -> list[dict[str, Any]]:
+        counter = Counter()
+        cursor = db.mentions.find(query, {"aspect_sentiment": 1})
+
+        for mention in cursor:
+            aspect_sentiment = mention.get("aspect_sentiment")
+            if not isinstance(aspect_sentiment, dict):
+                continue
+            for aspect, sentiment in aspect_sentiment.items():
+                aspect_name = str(aspect or "").strip().lower()
+                if not aspect_name:
+                    continue
+                if DashboardService._normalize_negative_sentiment(sentiment):
+                    counter[aspect_name] += 1
+
+        return [
+            {"aspect": aspect, "count": int(count)}
+            for aspect, count in counter.most_common(10)
+        ]
+
     @staticmethod
     def get_dashboard(
         user_id: str,
@@ -51,6 +131,8 @@ class DashboardService:
                     "sources_distribution": {},
                     "top_aspects": {},
                     "top_themes": {},
+                    "urgency_trend": [],
+                    "top_negative_aspects": [],
                     "critical_mentions": 0,
                     "average_urgency": 0,
                     "reputation_score": 0,
@@ -67,6 +149,8 @@ class DashboardService:
         metrics["total_comments"] = metrics.get("total_mentions", 0)
         metrics.setdefault("sources_distribution", metrics.get("source_distribution", {}))
         metrics.setdefault("top_themes", metrics.get("top_aspects", {}))
+        metrics["urgency_trend"] = DashboardService._compute_urgency_trend(db=db, query=query)
+        metrics["top_negative_aspects"] = DashboardService._compute_top_negative_aspects(db=db, query=query)
 
         # Identifica batch/search ID do contexto.
         selected_context_id = batch_id

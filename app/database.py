@@ -51,6 +51,7 @@ class MongoDB:
             cls.db.mentions.create_index([("user_id", 1), ("content_hash", 1)])
             cls.db.mentions.create_index([("user_id", 1), ("canonical_url", 1)])
             cls.db.mentions.create_index([("user_id", 1), ("source", 1), ("published_at", -1)])
+            cls.db.mentions.create_index([("user_id", 1), ("created_at", -1), ("criticality", 1)])
 
             cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("created_at", -1)])
             cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("canonical_url", 1)])

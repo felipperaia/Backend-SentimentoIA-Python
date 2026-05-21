@@ -157,6 +157,10 @@ class MentionInDB(MentionBase):
     id: str = Field(alias="_id")
     brand_id: str
     collected_at: datetime
+    urgency_factors: List[str] = Field(default_factory=list)
+    aspect_sentiment: dict[str, str] = Field(default_factory=dict)
+    confidence_score: Optional[float] = Field(default=None, ge=0, le=1)
+    summary: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -166,6 +170,10 @@ class MentionResponse(MentionBase):
     id: str = Field(alias="_id")
     brand_id: str
     collected_at: datetime
+    urgency_factors: List[str] = Field(default_factory=list)
+    aspect_sentiment: dict[str, str] = Field(default_factory=dict)
+    confidence_score: Optional[float] = Field(default=None, ge=0, le=1)
+    summary: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -317,6 +325,7 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: Optional[str] = None
     token_type: str = "bearer"
+    expires_in: Optional[int] = None
 
 
 class MFASetupResponse(BaseModel):

@@ -16,6 +16,8 @@ from .user import (
     UserUpdate,
     UserRole,
     TokenResponse,
+    RefreshTokenRequest,
+    TokenRefreshResponse,
 )
 
 from .mention import (
@@ -86,6 +88,8 @@ __all__ = [
     "UserUpdate",
     "UserRole",
     "TokenResponse",
+    "RefreshTokenRequest",
+    "TokenRefreshResponse",
     # Mention schemas
     "MentionBase",
     "MentionCreate",

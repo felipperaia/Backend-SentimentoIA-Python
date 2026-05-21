@@ -1,11 +1,13 @@
 ﻿import json
 import logging
 import re
+import asyncio
 from typing import Any
 
 import httpx
 
 from app.config import settings
+from app.services.urgency_engine import urgency_engine
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,110 @@ class LLMService:
     @staticmethod
     def _parse_json(response: str) -> dict[str, Any]:
         return LLMService.parse_json(response)
+
+    @staticmethod
+    def _clamp_score(value: Any, default: float = 0.0) -> float:
+        try:
+            if isinstance(value, str):
+                value = value.replace(",", ".").strip()
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(default)
+        return max(0.0, min(round(numeric, 4), 1.0))
+
+    @staticmethod
+    def _normalize_sentiment(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        mapping = {
+            "positive": "positivo",
+            "positivo": "positivo",
+            "negative": "negativo",
+            "negativo": "negativo",
+            "neutral": "neutro",
+            "neutro": "neutro",
+        }
+        return mapping.get(raw, "neutro")
+
+    @staticmethod
+    def _normalize_aspect_sentiment(value: Any) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        if isinstance(value, dict):
+            iterable = value.items()
+        elif isinstance(value, list):
+            iterable = []
+            for item in value:
+                if isinstance(item, dict):
+                    aspect = item.get("aspect")
+                    sentiment = item.get("sentiment")
+                    iterable.append((aspect, sentiment))
+        else:
+            iterable = []
+
+        for raw_aspect, raw_sentiment in iterable:
+            aspect = str(raw_aspect or "").strip().lower()[:80]
+            if not aspect:
+                continue
+            normalized[aspect] = LLMService._normalize_sentiment(raw_sentiment)
+
+        return normalized
+
+    @staticmethod
+    def _single_mention_messages(text: str) -> list[dict[str, str]]:
+        system_prompt = (
+            "Voce eh um classificador de mencoes de clientes. "
+            "Responda APENAS JSON valido, sem markdown, sem explicacoes extras."
+        )
+        user_prompt = (
+            "Analise a mencao e retorne exatamente este schema JSON:\n"
+            "{"
+            '\"sentiment\": \"positivo|neutro|negativo\", '
+            '\"urgency_score\": 0.0, '
+            '\"confidence_score\": 0.0, '
+            '\"aspect_sentiment\": {\"atendimento\": \"negativo\"}, '
+            '\"summary\": \"resumo curto\"'
+            "}\n"
+            "Regras:\n"
+            "- urgency_score e confidence_score devem estar entre 0 e 1.\n"
+            "- aspect_sentiment deve ter no maximo 5 aspectos.\n"
+            "- summary com no maximo 280 caracteres.\n"
+            f"\nMencao:\n{text[:5000]}"
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    @staticmethod
+    def _build_single_mention_result(
+        sentiment: Any,
+        llm_urgency_score: Any,
+        confidence_score: Any,
+        aspect_sentiment: Any,
+        summary: Any,
+        text: str,
+    ) -> dict[str, Any]:
+        normalized_sentiment = LLMService._normalize_sentiment(sentiment)
+        llm_score = LLMService._clamp_score(llm_urgency_score, default=0.0)
+        confidence = LLMService._clamp_score(confidence_score, default=0.5)
+        normalized_aspects = LLMService._normalize_aspect_sentiment(aspect_sentiment)
+        summary_text = str(summary or "").strip()
+        if not summary_text:
+            summary_text = "Analise automatica sem resumo detalhado."
+        summary_text = summary_text[:280]
+
+        factors = urgency_engine.extract_factors(text)
+        score_final = urgency_engine.boost_score(llm_score, factors)
+        criticality = urgency_engine.classify(score_final)
+
+        return {
+            "sentiment": normalized_sentiment,
+            "urgency_score": score_final,
+            "confidence_score": confidence,
+            "aspect_sentiment": normalized_aspects,
+            "summary": summary_text,
+            "urgency_factors": factors,
+            "criticality": criticality,
+        }
 
     @staticmethod
     def normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +518,63 @@ class LLMService:
             ],
         }
         return await LLMService.analyze_snapshot(snapshot=snapshot)
+
+    @staticmethod
+    async def analyze_single_mention(text: str) -> dict[str, Any]:
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return LLMService._build_single_mention_result(
+                sentiment="neutro",
+                llm_urgency_score=0.0,
+                confidence_score=0.5,
+                aspect_sentiment={},
+                summary="Texto vazio para analise.",
+                text="",
+            )
+
+        if not LLMService.ollama_configured():
+            logger.warning("LLM nao configurada para analise individual; fallback aplicado")
+            return LLMService._build_single_mention_result(
+                sentiment="neutro",
+                llm_urgency_score=0.0,
+                confidence_score=0.4,
+                aspect_sentiment={},
+                summary="Analise feita em modo fallback por indisponibilidade da LLM.",
+                text=clean_text,
+            )
+
+        messages = LLMService._single_mention_messages(clean_text)
+        try:
+            response_text = await LLMService.call_ollama_chat(messages)
+        except Exception as exc:
+            logger.warning("Falha na chamada LLM para analise individual: %s", exc)
+            response_text = ""
+
+        parsed = LLMService.parse_json(response_text) if response_text else {}
+
+        return LLMService._build_single_mention_result(
+            sentiment=parsed.get("sentiment"),
+            llm_urgency_score=parsed.get("urgency_score"),
+            confidence_score=parsed.get("confidence_score"),
+            aspect_sentiment=parsed.get("aspect_sentiment"),
+            summary=parsed.get("summary"),
+            text=clean_text,
+        )
+
+    @staticmethod
+    def analyze_single_mention_sync(text: str) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+            return LLMService._build_single_mention_result(
+                sentiment="neutro",
+                llm_urgency_score=0.0,
+                confidence_score=0.4,
+                aspect_sentiment={},
+                summary="Analise fallback aplicada por contexto de loop em execucao.",
+                text=str(text or ""),
+            )
+        except RuntimeError:
+            return asyncio.run(LLMService.analyze_single_mention(text))
 
     @staticmethod
     async def answer_domain_chat(

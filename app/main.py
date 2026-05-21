@@ -9,13 +9,17 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app.api.admin_router import router as admin_router
 from app.api.auth_router import router as auth_router
 from app.api.ingestion_router import router as ingestion_router
+from app.api.metrics_router import router as metrics_router
 from app.api.mentions_router import router as mentions_router
 from app.api.reports_router import router as reports_router
-from app.auth_utils import get_current_user
+from app.auth_utils import decode_access_token, get_current_user
 from app.config import settings
 from app.database import connect_db, disconnect_db, get_db
 from app.models import ScrapeRequest, SearchRequest
@@ -34,6 +38,24 @@ from app.services.source_registry_service import SourceRegistryService
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+def _limiter_key(request: Request) -> str:
+    authorization = str(request.headers.get("Authorization") or "").strip()
+    if authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        if token:
+            try:
+                payload = decode_access_token(token)
+                subject = str(payload.get("sub") or "").strip()
+                if subject:
+                    return f"user:{subject}"
+            except HTTPException:
+                pass
+    return f"ip:{get_remote_address(request)}"
+
+
+limiter = Limiter(key_func=_limiter_key)
 
 
 class AnalyzeRequest(BaseModel):
@@ -168,6 +190,27 @@ def _hash_user_agent(user_agent: str | None) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+async def rate_limit_exceeded_handler(request: Request, exc: Exception):
+    response = _rate_limit_exceeded_handler(request, exc)
+    retry_after_raw = response.headers.get("Retry-After")
+    retry_after: int | None = None
+    if retry_after_raw is not None:
+        try:
+            retry_after = int(float(str(retry_after_raw).strip()))
+        except (TypeError, ValueError):
+            retry_after = None
+
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": "Limite de requisicoes atingido. Tente novamente em instantes.",
+        "detail": "Limite de requisicoes atingido. Tente novamente em instantes.",
+    }
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
+
+    return JSONResponse(status_code=429, content=payload, headers=dict(response.headers))
+
+
 async def auto_refresh_loop() -> None:
     """Atualização automática opcional.
 
@@ -223,6 +266,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -409,7 +454,8 @@ async def integrations_status():
 
 
 @app.post("/api/search")
-async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] = Depends(get_current_user)):
+@limiter.limit(f"{settings.rate_limit_search_per_minute}/minute")
+async def search_mentions(request: Request, payload: SearchRequest, current_user: dict[str, Any] = Depends(get_current_user)):
     """Executa busca real e salva tudo por search_id.
 
     Entrada esperada:
@@ -436,21 +482,25 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
         locality=payload.locality,
         use_cache=not payload.replace_existing,
     )
+    del request
     return result
 
 
 @app.post("/api/scrape")
-async def scrape_mentions(payload: ScrapeRequest, current_user: dict[str, Any] = Depends(get_current_user)):
+@limiter.limit(f"{settings.rate_limit_scrape_per_minute}/minute")
+async def scrape_mentions(request: Request, payload: ScrapeRequest, current_user: dict[str, Any] = Depends(get_current_user)):
     """Executa scraping simples por fonte e retorna resultados agrupados."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     sources = [getattr(source, "value", str(source)) for source in payload.sources]
     try:
-        return await ScraperService.scrape_async(
+        result = await ScraperService.scrape_async(
             query=payload.query,
             sources=sources,
             limit_per_source=payload.limit_per_source,
             user_id=user_id,
         )
+        del request
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -740,7 +790,9 @@ async def send_chat_message(
 
 
 @app.post("/api/analyze")
+@limiter.limit(f"{settings.rate_limit_analyze_per_minute}/minute")
 async def analyze(
+    request: Request,
     payload: AnalyzeRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
@@ -765,7 +817,28 @@ async def analyze(
     if not mention:
         raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
 
-    mention.update(EnrichmentService.analyze_mention(mention["text"], mention.get("rating")))
+    enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
+    llm_analysis = await LLMService.analyze_single_mention(mention["text"])
+
+    merged_aspects = list(enrichment.get("aspects") or [])
+    for aspect in (llm_analysis.get("aspect_sentiment") or {}).keys():
+        if aspect not in merged_aspects:
+            merged_aspects.append(aspect)
+
+    mention.update(enrichment)
+    mention.update(
+        {
+            "sentiment": llm_analysis.get("sentiment", enrichment.get("sentiment", "neutro")),
+            "confidence": round(float(llm_analysis.get("confidence_score", enrichment.get("confidence", 0.55)) or 0.55), 3),
+            "confidence_score": round(float(llm_analysis.get("confidence_score", enrichment.get("confidence", 0.55)) or 0.55), 3),
+            "urgency_score": round(float(llm_analysis.get("urgency_score", enrichment.get("urgency_score", 0.0)) or 0.0), 4),
+            "criticality": llm_analysis.get("criticality", enrichment.get("criticality", "baixa")),
+            "urgency_factors": llm_analysis.get("urgency_factors") or [],
+            "aspect_sentiment": llm_analysis.get("aspect_sentiment") or {},
+            "summary": llm_analysis.get("summary") or "",
+            "aspects": merged_aspects,
+        }
+    )
     mention.update({
         "user_id": user_id,
         "search_id": search_id,
@@ -774,6 +847,7 @@ async def analyze(
 
     result = db.mentions.insert_one(mention)
     mention["_id"] = result.inserted_id
+    del request
     return SearchService.serialize(mention)
 
 
@@ -1053,5 +1127,6 @@ async def nps_metrics(
 
 # Routers adicionais para compatibilidade com endpoints especializados.
 app.include_router(mentions_router, prefix="/api/mentions")
+app.include_router(metrics_router, prefix="/api/metrics", tags=["Métricas"])
 app.include_router(reports_router, prefix="/api/reports-admin")
 app.include_router(admin_router, prefix="/api/admin")

@@ -61,6 +61,10 @@ class MentionCreate(MentionBase):
 class MentionResponse(MentionBase):
     id: Optional[str] = None
     brand_id: str
+    urgency_factors: List[str] = Field(default_factory=list)
+    aspect_sentiment: Dict[str, str] = Field(default_factory=dict)
+    confidence_score: Optional[float] = Field(default=None, ge=0, le=1)
+    summary: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     

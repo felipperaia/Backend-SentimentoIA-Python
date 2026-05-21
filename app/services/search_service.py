@@ -8,6 +8,7 @@ from app.services.collector_service import CollectorService
 from app.services.enrichment_service import EnrichmentService
 from app.services.llm_service import LLMService
 from app.services.normalization_service import canonicalize_url, make_search_id, utcnow
+from app.services.urgency_engine import urgency_engine
 
 logger = logging.getLogger(__name__)
 
@@ -271,12 +272,26 @@ class SearchService:
                 continue
 
             enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
+            urgency_factors = urgency_engine.extract_factors(mention["text"])
+            urgency_score = urgency_engine.boost_score(float(enrichment.get("urgency_score", 0.0) or 0.0), urgency_factors)
+            criticality = urgency_engine.classify(urgency_score)
+            aspect_sentiment = {
+                str(aspect): str(enrichment.get("sentiment") or "neutro")
+                for aspect in (enrichment.get("aspects") or [])
+                if str(aspect).strip()
+            }
             mention_rank_score = SearchService._rank_mention(mention, enrichment)
             mention.update(enrichment)
             mention.update({
                 "search_id": search_id,
                 "user_id": user_id,
                 "query": query,
+                "urgency_score": round(urgency_score, 4),
+                "criticality": criticality,
+                "confidence_score": round(float(enrichment.get("confidence", 0.55) or 0.55), 3),
+                "urgency_factors": urgency_factors,
+                "aspect_sentiment": aspect_sentiment,
+                "summary": "",
                 "mention_rank_score": mention_rank_score,
                 "created_at": utcnow(),
             })
@@ -350,7 +365,11 @@ class SearchService:
         alerts: list[dict[str, Any]] = []
         now = utcnow()
 
-        critical_mentions = [m for m in mentions if m.get("criticality") == "alta"]
+        critical_mentions = [
+            m
+            for m in mentions
+            if str(m.get("criticality") or "").strip().lower() in {"alta", "critica", "crítica", "high", "critical"}
+        ]
 
         if critical_mentions:
             alerts.append({
