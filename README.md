@@ -128,6 +128,40 @@ Comando recomendado no ambiente atual:
 py -3.13 -m pytest -q
 ```
 
+## Deploy no HostingGuru.io
+
+Para esse repositorio, use o deploy pela raiz (Root Directory vazio).
+
+- Build Command (recomendado):
+
+```bash
+pip install -r requirements.txt
+```
+
+- Build Command (somente se voce realmente usar coletores com Playwright):
+
+```bash
+pip install -r requirements.txt && python -m playwright install chromium
+```
+
+- Start Command (API + worker juntos no mesmo servico):
+
+```bash
+python -m app.hostingguru_start
+```
+
+- Health Check Path:
+
+```text
+/health
+```
+
+Observacoes importantes:
+
+- Nao use `cd apps/api`, essa pasta nao existe neste projeto.
+- O script `app.hostingguru_start` sobe a API e inicia o worker no mesmo start command.
+- A porta e lida da variavel `PORT` da plataforma (com fallback para 3000).
+
 ## Resumo rapido
 
 Se voce precisa subir o sistema localmente:
