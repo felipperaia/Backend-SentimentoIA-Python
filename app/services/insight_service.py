@@ -66,12 +66,23 @@ class InsightService:
 
     @staticmethod
     def _serialize_settings(settings_doc: dict[str, Any]) -> dict[str, Any]:
+        locale = str(settings_doc.get("locale") or "pt-BR").strip()
+        if locale not in ALLOWED_LOCALES:
+            locale = "pt-BR"
+
+        theme = str(settings_doc.get("theme") or "light").strip().lower()
+        if theme not in ALLOWED_THEMES:
+            theme = "light"
+
+        try:
+            threshold = int(settings_doc.get("llm_trigger_min_comments", settings.LLM_TRIGGER_MIN_COMMENTS))
+        except (TypeError, ValueError):
+            threshold = int(settings.LLM_TRIGGER_MIN_COMMENTS)
+
         return {
-            "theme": settings_doc.get("theme", "light"),
-            "locale": settings_doc.get("locale", "pt-BR"),
-            "llm_trigger_min_comments": int(
-                settings_doc.get("llm_trigger_min_comments", settings.LLM_TRIGGER_MIN_COMMENTS)
-            ),
+            "theme": theme,
+            "locale": locale,
+            "llm_trigger_min_comments": max(1, threshold),
             "updated_at": settings_doc.get("updated_at").isoformat()
             if isinstance(settings_doc.get("updated_at"), datetime)
             else settings_doc.get("updated_at"),

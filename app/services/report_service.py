@@ -279,16 +279,66 @@ class ReportService:
         priority: str | None,
         resolution: str | None,
         limit: int,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        query: dict[str, Any] = {"user_id": user_id, "archived": {"$ne": True}}
+        conditions: list[dict[str, Any]] = [{"user_id": user_id}, {"archived": {"$ne": True}}]
 
         normalized_priority = ReportService._normalize_priority_filter(priority)
         normalized_resolution = ReportService._normalize_resolution_filter(resolution)
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_slug)
 
         if normalized_priority:
-            query["priority"] = normalized_priority
+            conditions.append({"priority": normalized_priority})
         if normalized_resolution:
-            query["resolution"] = normalized_resolution
+            conditions.append({"resolution": normalized_resolution})
+
+        if normalized_company_slug:
+            company_regex = ReportService._company_regex_from_slug(normalized_company_slug)
+            conditions.append(
+                {
+                    "$or": [
+                        {"company_slug": normalized_company_slug},
+                        {"snapshot.company_slug": normalized_company_slug},
+                        {"company": {"$regex": company_regex, "$options": "i"}},
+                        {"company_name": {"$regex": company_regex, "$options": "i"}},
+                        {"snapshot.brand": {"$regex": company_regex, "$options": "i"}},
+                        {"snapshot.company_name": {"$regex": company_regex, "$options": "i"}},
+                    ]
+                }
+            )
+
+        if period_from:
+            conditions.append(
+                {
+                    "$or": [
+                        {"period_to": {"$gte": period_from}},
+                        {
+                            "$and": [
+                                {"period_to": {"$exists": False}},
+                                {"created_at": {"$gte": period_from}},
+                            ]
+                        },
+                    ]
+                }
+            )
+        if period_to:
+            conditions.append(
+                {
+                    "$or": [
+                        {"period_from": {"$lte": period_to}},
+                        {
+                            "$and": [
+                                {"period_from": {"$exists": False}},
+                                {"created_at": {"$lte": period_to}},
+                            ]
+                        },
+                    ]
+                }
+            )
+
+        query: dict[str, Any] = {"$and": conditions}
 
         return list(
             db.insights.find(query).sort("created_at", -1).limit(max(1, min(limit, 500)))
@@ -300,6 +350,9 @@ class ReportService:
         priority: str | None = None,
         resolution: str | None = None,
         limit: int = 100,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
     ) -> StreamingResponse:
         db = get_db()
         insights = ReportService._load_insights(
@@ -308,6 +361,9 @@ class ReportService:
             priority=priority,
             resolution=resolution,
             limit=limit,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
         )
 
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -360,6 +416,9 @@ class ReportService:
         priority: str | None = None,
         resolution: str | None = None,
         limit: int = 100,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
     ) -> Response:
         reportlab = ReportService._load_reportlab_components()
         if reportlab is None:
@@ -385,6 +444,9 @@ class ReportService:
             priority=priority,
             resolution=resolution,
             limit=limit,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
         )
 
         buffer = io.BytesIO()
@@ -431,6 +493,91 @@ class ReportService:
             content=pdf,
             media_type="application/pdf",
             headers={"Content-Disposition": 'attachment; filename="insights.pdf"'},
+        )
+
+    @staticmethod
+    def export_insights_csv(
+        user_id: str,
+        priority: str | None = None,
+        resolution: str | None = None,
+        limit: int = 100,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+    ) -> StreamingResponse:
+        db = get_db()
+        insights = ReportService._load_insights(
+            db=db,
+            user_id=user_id,
+            priority=priority,
+            resolution=resolution,
+            limit=limit,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+        )
+
+        def _serialize_dt(value: Any) -> str:
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return str(value or "")
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "insight_id",
+                "company_name",
+                "company_slug",
+                "priority",
+                "urgency",
+                "status",
+                "resolution",
+                "period_from",
+                "period_to",
+                "created_at",
+                "root_cause",
+                "recommended_action",
+                "executive_summary",
+                "decision_guidance",
+            ]
+        )
+
+        for item in insights:
+            snapshot = item.get("snapshot") if isinstance(item.get("snapshot"), dict) else {}
+            company_name = str(
+                item.get("company_name")
+                or item.get("company")
+                or snapshot.get("company_name")
+                or snapshot.get("brand")
+                or ""
+            )
+            company_slug_value = str(item.get("company_slug") or snapshot.get("company_slug") or "")
+
+            writer.writerow(
+                [
+                    item.get("insight_id") or item.get("id") or "",
+                    company_name,
+                    company_slug_value,
+                    item.get("priority") or "",
+                    item.get("urgency") or "",
+                    item.get("status") or "",
+                    item.get("resolution") or "",
+                    _serialize_dt(item.get("period_from")),
+                    _serialize_dt(item.get("period_to")),
+                    _serialize_dt(item.get("created_at")),
+                    (item.get("root_cause") or ""),
+                    (item.get("recommended_action") or ""),
+                    (item.get("executive_summary") or ""),
+                    (item.get("decision_guidance") or ""),
+                ]
+            )
+
+        content = buffer.getvalue().encode("utf-8-sig")
+        return StreamingResponse(
+            io.BytesIO(content),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="insights.csv"'},
         )
 
     @staticmethod

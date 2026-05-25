@@ -1102,6 +1102,10 @@ async def export_latest_report(
 async def export_insights_markdown(
     priority: str | None = Query(None),
     resolution: str | None = Query(None),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
     limit: int = Query(100, ge=1, le=500),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
@@ -1111,6 +1115,33 @@ async def export_insights_markdown(
         user_id=user_id,
         priority=priority,
         resolution=resolution,
+        company_slug=company_slug or company_id,
+        period_from=period_from,
+        period_to=period_to,
+        limit=limit,
+    )
+
+
+@app.get("/api/insights/export/csv")
+async def export_insights_csv(
+    priority: str | None = Query(None),
+    resolution: str | None = Query(None),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exporta insights filtrados em CSV."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    return ReportService.export_insights_csv(
+        user_id=user_id,
+        priority=priority,
+        resolution=resolution,
+        company_slug=company_slug or company_id,
+        period_from=period_from,
+        period_to=period_to,
         limit=limit,
     )
 
@@ -1119,6 +1150,10 @@ async def export_insights_markdown(
 async def export_insights_pdf(
     priority: str | None = Query(None),
     resolution: str | None = Query(None),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
     limit: int = Query(100, ge=1, le=500),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
@@ -1128,6 +1163,9 @@ async def export_insights_pdf(
         user_id=user_id,
         priority=priority,
         resolution=resolution,
+        company_slug=company_slug or company_id,
+        period_from=period_from,
+        period_to=period_to,
         limit=limit,
     )
 

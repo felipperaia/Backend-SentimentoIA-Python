@@ -1,36 +1,148 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.auth_utils import get_current_user
 from app.database import get_db
-from app.services.dashboard_service import DashboardService
 from app.services.normalization_service import utcnow
 
 router = APIRouter()
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 @router.get("")
-@router.get("/")
-async def aggregated_metrics(
+async def get_metrics(
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
+    period_days: int = Query(30, alias="periodDays", ge=1, le=365),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
+    """Retorna métricas agregadas por empresa e período."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Banco de dados indisponivel")
+
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    return DashboardService.aggregate_metrics(
-        user_id=user_id,
-        company_slug=company_slug or company_id,
-        period_from=period_from,
-        period_to=period_to,
-    )
+
+    slug = company_slug or company_id
+    now = _utcnow()
+    date_from = period_from or (now - timedelta(days=period_days))
+    date_to = period_to or now
+
+    match_query: dict[str, Any] = {
+        "user_id": user_id,
+        "status": "processed",
+    }
+
+    if slug:
+        slug_text = str(slug).replace("-", " ")
+        match_query["$or"] = [
+            {"brand_name": {"$regex": slug_text, "$options": "i"}},
+            {"query": {"$regex": slug_text, "$options": "i"}},
+        ]
+
+    if date_from or date_to:
+        date_filter: dict[str, Any] = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to
+        match_query["published_at"] = date_filter
+
+    pipeline = [
+        {"$match": match_query},
+        {
+            "$group": {
+                "_id": "$sentiment",
+                "count": {"$sum": 1},
+                "avg_urgency": {"$avg": "$urgency_score"},
+            }
+        },
+    ]
+
+    sentiment_agg = list(db.mentions.aggregate(pipeline))
+    total = sum(int(item.get("count", 0) or 0) for item in sentiment_agg)
+    sentiment_dist = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
+    avg_urgency = 0.0
+
+    for item in sentiment_agg:
+        key = str(item.get("_id") or "").lower()
+        ratio = round((int(item.get("count", 0) or 0) / total), 4) if total else 0.0
+        if key in ("positivo", "positive"):
+            sentiment_dist["positive"] = ratio
+        elif key in ("negativo", "negative"):
+            sentiment_dist["negative"] = ratio
+        else:
+            sentiment_dist["neutral"] = ratio
+        avg_urgency += float(item.get("avg_urgency") or 0.0)
+
+    if sentiment_agg:
+        avg_urgency = round(avg_urgency / len(sentiment_agg), 4)
+
+    aspect_pipeline = [
+        {"$match": match_query},
+        {"$unwind": "$aspects"},
+        {"$group": {"_id": "$aspects", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10},
+    ]
+    aspects_raw = list(db.mentions.aggregate(aspect_pipeline))
+    most_cited = [{"label": a.get("_id"), "mentions": a.get("count")} for a in aspects_raw if a.get("_id")]
+
+    urgency_pipeline = [
+        {"$match": {**match_query, "urgency_score": {"$exists": True, "$ne": None}}},
+        {
+            "$group": {
+                "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$published_at"}},
+                "avg_urgency": {"$avg": "$urgency_score"},
+            }
+        },
+        {"$sort": {"_id": 1}},
+        {"$limit": 60},
+    ]
+    urgency_evolution = [
+        {"date": u.get("_id"), "avg_urgency": round(float(u.get("avg_urgency") or 0), 4)}
+        for u in db.mentions.aggregate(urgency_pipeline)
+        if u.get("_id")
+    ]
+
+    neg_pipeline = [
+        {"$match": {**match_query, "sentiment": {"$in": ["negativo", "negative"]}}},
+        {"$unwind": "$aspects"},
+        {"$group": {"_id": "$aspects", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10},
+    ]
+    top_negative = [
+        {"label": a.get("_id"), "mentions": a.get("count")}
+        for a in db.mentions.aggregate(neg_pipeline)
+        if a.get("_id")
+    ]
+
+    company_name = str(slug).replace("-", " ").title() if slug else "Todas as empresas"
+
+    return {
+        "ok": True,
+        "company_id": slug,
+        "company_name": company_name,
+        "period_from": date_from.isoformat() if date_from else None,
+        "period_to": date_to.isoformat() if date_to else None,
+        "total_mentions": total,
+        "average_urgency": avg_urgency,
+        "sentiment_distribution": sentiment_dist,
+        "urgency_evolution": urgency_evolution,
+        "most_cited_aspects": most_cited,
+        "top_negative_aspects": top_negative,
+    }
 
 
 def _normalize_sentiment(value: Any) -> str:

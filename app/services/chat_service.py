@@ -13,66 +13,6 @@ from app.services.search_service import SearchService
 PROMPTS_DIR = Path(__file__).resolve().parents[4] / "packages" / "prompts"
 DB_UNAVAILABLE_ERROR = "Banco de dados indisponivel"
 DEFAULT_THREAD_TITLE = "Nova conversa"
-OUT_OF_SCOPE_KEYWORDS = [
-    "futebol",
-    "copa",
-    "esporte",
-    "receita",
-    "culinaria",
-    "culinária",
-    "politica",
-    "política",
-    "presidente",
-    "noticia",
-    "notícia",
-    "clima",
-    "tempo",
-    "bitcoin",
-    "crypto",
-    "como programar",
-    "codigo",
-    "código",
-    "python tutorial",
-]
-IN_SCOPE_KEYWORDS = [
-    "sentimento",
-    "sentiment",
-    "reputacao",
-    "reputação",
-    "marca",
-    "dashboard",
-    "insight",
-    "insights",
-    "mencoes",
-    "menções",
-    "alerta",
-    "alertas",
-    "relatorio",
-    "relatorio",
-    "nps",
-    "busca",
-    "comentarios",
-    "comentários",
-    "critico",
-    "crítico",
-    "criticidade",
-    "acao",
-    "ação",
-    "prioridade",
-    "risco",
-    "riscos",
-    "oportunidade",
-    "oportunidades",
-    "resolucao",
-    "resolução",
-    "filtro",
-    "filtros",
-    "fonte",
-    "fontes",
-    "pesquisa",
-    "relatorios",
-    "relatórios",
-]
 
 
 
@@ -99,36 +39,6 @@ class ChatService:
             return f"{system_prompt}\n\n---\n\n## BASE DE CONHECIMENTO DO SISTEMA\n{knowledge}"
         except Exception:
             return "Você é o assistente do SentimentoIA. Responda apenas sobre análise de sentimentos."
-
-    @staticmethod
-    def _scope_verdict(message: str) -> tuple[bool, str]:
-        msg_lower = str(message or "").lower().strip()
-        if not msg_lower:
-            return False, "empty_message"
-
-        if any(keyword in msg_lower for keyword in OUT_OF_SCOPE_KEYWORDS):
-            return False, "blocked_keyword"
-
-        if any(keyword in msg_lower for keyword in IN_SCOPE_KEYWORDS):
-            return True, "domain_keyword"
-
-        # Dominio fechado: sem sinal claro de SentimentoIA, a mensagem e recusada.
-        return False, "missing_domain_signal"
-
-    @staticmethod
-    def _is_in_scope(message: str) -> bool:
-        verdict, _reason = ChatService._scope_verdict(message)
-        return verdict
-
-    @staticmethod
-    def _refusal_message(locale: str) -> str:
-        del locale
-        return "Posso ajudar apenas com análises de sentimento e reputação da sua marca no SentimentoIA."
-
-    @staticmethod
-    def _temporary_unavailable_message(locale: str) -> str:
-        del locale
-        return "Assistente temporariamente indisponivel. Tente novamente em instantes."
 
     @staticmethod
     def _serialize_thread(item: dict[str, Any]) -> dict[str, Any]:
@@ -296,80 +206,69 @@ class ChatService:
         }
         db.chat_messages.insert_one(user_message)
 
-        in_scope, refusal_reason = ChatService._scope_verdict(clean_content)
-        assistant_metadata: dict[str, Any] = {"out_of_scope": False}
-        if not in_scope:
-            assistant_content = ChatService._refusal_message(locale=locale)
-            assistant_metadata = {
-                "out_of_scope": True,
-                "refusal_reason": refusal_reason,
-            }
-        else:
-            history_docs = list(
-                db.chat_messages.find(
-                    {"user_id": user_id, "thread_id": thread_id, "role": {"$in": ["user", "assistant"]}}
-                )
-                .sort("created_at", -1)
-                .limit(12)
+        history_docs = list(
+            db.chat_messages.find(
+                {"user_id": user_id, "thread_id": thread_id, "role": {"$in": ["user", "assistant"]}}
             )
-            history_docs.reverse()
-            history_messages = [
-                {
-                    "role": str(item.get("role") or "user"),
-                    "content": str(item.get("content") or ""),
-                }
-                for item in history_docs
-            ]
+            .sort("created_at", -1)
+            .limit(12)
+        )
+        history_docs.reverse()
+        history_messages = [
+            {
+                "role": str(item.get("role") or "user"),
+                "content": str(item.get("content") or ""),
+            }
+            for item in history_docs
+        ]
 
-            authorized_context = ChatService._authorized_context(user_id=user_id)
-            messages = [
-                {"role": "system", "content": ChatService._load_system_prompt()},
+        authorized_context = ChatService._authorized_context(user_id=user_id)
+        messages = [
+            {"role": "system", "content": ChatService._load_system_prompt()},
+            {
+                "role": "system",
+                "content": (
+                    "DADOS AUTORIZADOS DO USUÁRIO:\n"
+                    f"{json.dumps(authorized_context, ensure_ascii=False, default=str)}"
+                ),
+            },
+            *history_messages,
+            {"role": "user", "content": clean_content},
+        ]
+
+        try:
+            assistant_content = await LLMService.answer_domain_chat(
+                messages=messages,
+                authorized_context=authorized_context,
+                fail_on_unavailable=True,
+            )
+        except RuntimeError as exc:
+            db.chat_threads.update_one(
+                {"_id": thread_id, "user_id": user_id},
                 {
-                    "role": "system",
-                    "content": (
-                        "DADOS AUTORIZADOS DO USUÁRIO:\n"
-                        f"{json.dumps(authorized_context, ensure_ascii=False, default=str)}"
-                    ),
+                    "$set": {
+                        "locale": locale,
+                        "updated_at": now,
+                        "last_message_at": now,
+                    }
                 },
-                *history_messages,
-                {"role": "user", "content": clean_content},
-            ]
+            )
+            raise ChatUnavailableError(
+                "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
+            ) from exc
 
-            try:
-                assistant_content = await LLMService.answer_domain_chat(
-                    messages=messages,
-                    authorized_context=authorized_context,
-                    fail_on_unavailable=True,
-                )
-            except RuntimeError as exc:
-                db.chat_threads.update_one(
-                    {"_id": thread_id, "user_id": user_id},
-                    {
-                        "$set": {
-                            "locale": locale,
-                            "updated_at": now,
-                            "last_message_at": now,
-                        }
-                    },
-                )
-                raise ChatUnavailableError(
-                    "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
-                ) from exc
-
-            if not isinstance(assistant_content, str) or not assistant_content.strip():
-                db.chat_threads.update_one(
-                    {"_id": thread_id, "user_id": user_id},
-                    {
-                        "$set": {
-                            "locale": locale,
-                            "updated_at": now,
-                            "last_message_at": now,
-                        }
-                    },
-                )
-                raise ChatUnavailableError(
-                    "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
-                )
+        if not isinstance(assistant_content, str) or not assistant_content.strip():
+            db.chat_threads.update_one(
+                {"_id": thread_id, "user_id": user_id},
+                {
+                    "$set": {
+                        "locale": locale,
+                        "updated_at": now,
+                        "last_message_at": now,
+                    }
+                },
+            )
+            raise ChatUnavailableError("LLM retornou resposta vazia")
 
         now_response = utcnow()
         assistant_id = f"cmsg_{now_response.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
@@ -380,7 +279,7 @@ class ChatService:
             "user_id": user_id,
             "role": "assistant",
             "content": assistant_content[:3500],
-            "metadata": assistant_metadata,
+            "metadata": {"source": "ollama"},
             "created_at": now_response,
         }
         db.chat_messages.insert_one(assistant_message)
