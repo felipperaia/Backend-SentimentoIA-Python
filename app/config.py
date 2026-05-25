@@ -104,6 +104,7 @@ class Settings(BaseSettings):
     privacy_contact_email: str = ""
 
     # Auto refresh
+    AUTO_REFRESH_ENABLED: bool = False
     auto_refresh_enabled: bool = False
     auto_refresh_interval_minutes: int = 60
 

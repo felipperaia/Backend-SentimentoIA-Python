@@ -1,5 +1,4 @@
-import json
-from pathlib import Path
+﻿import json
 from typing import Any
 from uuid import uuid4
 import re
@@ -12,10 +11,14 @@ from app.services.llm_service import LLMService
 from app.services.normalization_service import utcnow
 from app.services.search_service import SearchService
 
-PROMPTS_DIR = Path(__file__).resolve().parents[4] / "packages" / "prompts"
 DB_UNAVAILABLE_ERROR = "Banco de dados indisponivel"
 DEFAULT_THREAD_TITLE = "Nova conversa"
-
+SYSTEM_PROMPT = (
+    "Voce e um assistente especializado em analise de reputacao e sentimentos de marcas. "
+    "Responda sempre em portugues brasileiro. "
+    "Use os dados de mencoes, sentimentos e insights disponiveis no contexto para fundamentar suas respostas. "
+    "Seja direto, objetivo e profissional."
+)
 
 
 class ChatUnavailableError(RuntimeError):
@@ -35,12 +38,7 @@ class ChatService:
 
     @staticmethod
     def _load_system_prompt() -> str:
-        try:
-            system_prompt = (PROMPTS_DIR / "domain-closed-system-prompt.md").read_text(encoding="utf-8")
-            knowledge = (PROMPTS_DIR / "domain-knowledge-base.md").read_text(encoding="utf-8")
-            return f"{system_prompt}\n\n---\n\n## BASE DE CONHECIMENTO DO SISTEMA\n{knowledge}"
-        except Exception:
-            return "Você é o assistente do SentimentoIA. Responda apenas sobre análise de sentimentos."
+        return SYSTEM_PROMPT
 
     @staticmethod
     def _serialize_thread(item: dict[str, Any]) -> dict[str, Any]:
@@ -230,7 +228,7 @@ class ChatService:
             {
                 "role": "system",
                 "content": (
-                    "DADOS AUTORIZADOS DO USUÁRIO:\n"
+                    "DADOS AUTORIZADOS DO USUÃRIO:\n"
                     f"{json.dumps(authorized_context, ensure_ascii=False, default=str)}"
                 ),
             },
@@ -313,3 +311,4 @@ class ChatService:
             "user_message": ChatService._serialize_message(user_message),
             "assistant_message": ChatService._serialize_message(assistant_message),
         }
+

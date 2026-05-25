@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import hashlib
 import logging
 from contextlib import asynccontextmanager
@@ -215,30 +215,8 @@ async def rate_limit_exceeded_handler(request: Request, exc: Exception):
 
 
 async def auto_refresh_loop() -> None:
-    """Atualização automática opcional.
-
-    Quando AUTO_REFRESH_ENABLED=True, o backend reexecuta buscas recentes.
-    Isso mantém dashboard/histórico vivos sem depender do usuário clicar novamente.
-    """
-    while settings.AUTO_REFRESH_ENABLED:
-        try:
-            db = get_db()
-            if db is not None:
-                jobs = list(db.search_jobs.find({"status": "completed"}).sort("created_at", -1).limit(20))
-                for job in jobs:
-                    await SearchService.run_search(
-                        user_id=job["user_id"],
-                        query=job["query"],
-                        sources=job.get("sources", SourceRegistryService.default_sources()),
-                        period_days=job.get("period_days", 30),
-                        locality=job.get("locality"),
-                        use_cache=False,
-                    )
-        except Exception as exc:
-            logger.error("Erro no auto refresh: %s", exc)
-
-        await asyncio.sleep(settings.AUTO_REFRESH_INTERVAL_MINUTES * 60)
-
+    """Auto-refresh desabilitado. Dados vem do Secondary MongoDB via seed."""
+    return
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -249,7 +227,7 @@ async def lifespan(app: FastAPI):
     try:
         await LLMService.validate_connection()
     except Exception as exc:
-        logger.warning(f"Ollama não acessível. Funcionalidades de IA desabilitadas: {exc}")
+        logger.warning(f"Ollama nÃ£o acessÃ­vel. Funcionalidades de IA desabilitadas: {exc}")
 
     task = None
     if settings.auto_refresh_enabled:
@@ -302,7 +280,7 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-app.include_router(auth_router, prefix="/api/auth", tags=["Autenticação"])
+app.include_router(auth_router, prefix="/api/auth", tags=["AutenticaÃ§Ã£o"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
 app.include_router(demo_router, prefix="/api/demo", tags=["Demo"])
 app.include_router(companies_router, prefix="/api", tags=["Empresas"])
@@ -323,7 +301,7 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Evita que exceções inesperadas virem resposta HTML quebrada no frontend."""
+    """Evita que exceÃ§Ãµes inesperadas virem resposta HTML quebrada no frontend."""
     request_id = uuid4().hex
     logger.exception("Erro nao tratado request_id=%s path=%s", request_id, request.url.path)
 
@@ -339,7 +317,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 async def health():
-    """Healthcheck simples para saber se o backend está ativo."""
+    """Healthcheck simples para saber se o backend estÃ¡ ativo."""
     return {"status": "ok", "version": "1.0.0"}
 
 
@@ -350,9 +328,9 @@ async def privacy_policy():
         "effective_date": "2024-01-01",
         "lgpd_compliant": True,
         "data_controller": "SentimentoIA",
-        "data_subject_rights": ["acesso", "retificação", "exclusão", "portabilidade", "revogação"],
+        "data_subject_rights": ["acesso", "retificaÃ§Ã£o", "exclusÃ£o", "portabilidade", "revogaÃ§Ã£o"],
         "retention_policy": (
-            "Dados mantidos até exclusão pelo usuário ou "
+            "Dados mantidos atÃ© exclusÃ£o pelo usuÃ¡rio ou "
             f"{max(1, int(settings.DATA_RETENTION_YEARS))} anos de inatividade."
         ),
         "contact": settings.PRIVACY_CONTACT_EMAIL or "privacidade@sentimentoia.com",
@@ -390,7 +368,7 @@ async def privacy_consent(
 
     user_id = str(current_user.get("_id") or current_user.get("id")) if current_user else None
     if not user_id and not payload.session_id:
-        raise HTTPException(status_code=400, detail="Informe session_id quando não autenticado")
+        raise HTTPException(status_code=400, detail="Informe session_id quando nÃ£o autenticado")
 
     preferences = payload.normalized_preferences()
     consent = payload.resolved_consent()
@@ -459,7 +437,7 @@ async def get_privacy_consent(
     elif session_id:
         query = {"session_id": session_id}
     else:
-        raise HTTPException(status_code=400, detail="Informe session_id quando não autenticado")
+        raise HTTPException(status_code=400, detail="Informe session_id quando nÃ£o autenticado")
 
     doc = db.privacyconsents.find_one(query, sort=[("updated_at", -1), ("created_at", -1)])
     if not doc:
@@ -535,7 +513,7 @@ async def privacy_export_summary(current_user: dict[str, Any] = Depends(get_curr
 
 @app.get("/api/status/integrations")
 async def integrations_status():
-    """Mostra se as integrações principais estão configuradas."""
+    """Mostra se as integraÃ§Ãµes principais estÃ£o configuradas."""
     llm = await LLMService.healthcheck()
     active_sources = SourceRegistryService.active_sources()
     return {
@@ -553,36 +531,69 @@ async def integrations_status():
 
 @app.post("/api/search")
 @limiter.limit(f"{settings.rate_limit_search_per_minute}/minute")
-async def search_mentions(request: Request, payload: SearchRequest, current_user: dict[str, Any] = Depends(get_current_user)):
-    """Executa busca real e salva tudo por search_id.
-
-    Entrada esperada:
-    {
-      "brand_name": "Nike",
-                        "sources": ["reclameaqui", "reddit", "web"],
-      "period_days": 30,
-      "locality": "São Paulo",
-      "replace_existing": false
-    }
-
-    Observação:
-    - replace_existing=True força nova busca.
-    - replace_existing=False permite cache inteligente por CACHE_TTL_MINUTES.
+async def search_mentions(
+    request: Request,
+    payload: SearchRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
     """
-    sources = [getattr(source, "value", str(source)) for source in payload.sources]
+    Busca dados de mencoes no Secondary MongoDB Atlas.
+    O scrapper foi desativado - dados vem exclusivamente do banco secundario (seed).
+    """
+    del request
     user_id = str(current_user.get("_id") or current_user.get("id"))
 
-    result = await SearchService.run_search(
-        user_id=user_id,
-        query=payload.brand_name,
-        sources=sources,
-        period_days=payload.period_days,
-        locality=payload.locality,
-        use_cache=not payload.replace_existing,
-    )
-    del request
-    return result
+    try:
+        secondary_db = get_secondary_db()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Secondary MongoDB nao configurado. Insira dados via Seeds em Configuracoes.",
+        ) from exc
 
+    collection = secondary_db["demo_dashboard_snapshots"]
+    # Normaliza sempre para lowercase - case insensitive
+    brand_slug = payload.brand_name.strip().lower()
+
+    query: dict[str, Any] = {"user_id": user_id, "company_slug": brand_slug}
+
+    # Filtro por periodo se informado
+    if payload.period_days:
+        from datetime import timedelta
+        cutoff = datetime.utcnow() - timedelta(days=payload.period_days)
+        query["period_from"] = {"$gte": cutoff}
+
+    snapshots = list(collection.find(query).sort("period_from", -1).limit(1))
+
+    if not snapshots:
+        # Tenta busca parcial (ex: "samsung" encontra "samsung galaxy")
+        query_partial = {
+            "user_id": user_id,
+            "company_slug": {"$regex": f"^{brand_slug}", "$options": "i"},
+        }
+        snapshots = list(collection.find(query_partial).sort("period_from", -1).limit(1))
+
+    if not snapshots:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Nenhum dado encontrado para '{payload.brand_name}'. Insira dados via Seeds em Configuracoes.",
+        )
+
+    latest = snapshots[0]
+    # Retorna no mesmo formato que o frontend espera do search antigo
+    return {
+        "search_id": str(latest.get("_id", "")),
+        "brand_name": latest.get("company_name"),
+        "company_slug": latest.get("company_slug"),
+        "status": "completed",
+        "mentions": latest.get("mentions", []),
+        "metrics": latest.get("metrics", {}),
+        "insights": latest.get("insights", []),
+        "period_label": latest.get("period_label", ""),
+        "period_from": str(latest.get("period_from", "")),
+        "period_to": str(latest.get("period_to", "")),
+        "source": "secondary_mongodb",
+    }
 
 @app.post("/api/scrape")
 @limiter.limit(f"{settings.rate_limit_scrape_per_minute}/minute")
@@ -875,7 +886,7 @@ async def delete_chat_thread(
     thread_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exclui uma thread de chat e todas as suas mensagens (escopo do usuário)."""
+    """Exclui uma thread de chat e todas as suas mensagens (escopo do usuÃ¡rio)."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         deleted = ChatService.delete_thread(user_id=user_id, thread_id=thread_id)
@@ -892,7 +903,7 @@ async def delete_chat_thread_message(
     message_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exclui uma mensagem da thread do usuário."""
+    """Exclui uma mensagem da thread do usuÃ¡rio."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         deleted = ChatService.delete_message(user_id=user_id, thread_id=thread_id, message_id=message_id)
@@ -907,7 +918,7 @@ async def delete_chat_thread_message(
 async def delete_all_chat_threads(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exclui todas as threads e mensagens de chat do usuário autenticado."""
+    """Exclui todas as threads e mensagens de chat do usuÃ¡rio autenticado."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     result = ChatService.delete_all_threads(user_id=user_id)
     return {"ok": True, **result}
@@ -945,16 +956,16 @@ async def analyze(
     payload: AnalyzeRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Analisa um texto manualmente e salva como menção do usuário."""
+    """Analisa um texto manualmente e salva como menÃ§Ã£o do usuÃ¡rio."""
     db = get_db()
     user_id = str(current_user.get("_id") or current_user.get("id"))
     text = payload.text.strip()
 
     if not text:
-        raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
+        raise HTTPException(status_code=400, detail="Texto nÃ£o pode estar vazio")
 
     search_id = f"manual-{user_id}"
-    query = payload.brand_name or "Análise Manual"
+    query = payload.brand_name or "AnÃ¡lise Manual"
     mention = normalize_mention(
         query=query,
         source=payload.source or "manual",
@@ -964,7 +975,7 @@ async def analyze(
         raw={"manual": True},
     )
     if not mention:
-        raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
+        raise HTTPException(status_code=400, detail="Texto nÃ£o pode estar vazio")
 
     enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
     llm_analysis = await LLMService.analyze_single_mention(mention["text"])
@@ -1005,7 +1016,7 @@ async def search_history(
     limit: int = Query(20, ge=1, le=100),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Histórico de buscas do usuário."""
+    """HistÃ³rico de buscas do usuÃ¡rio."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     return {"history": SearchService.history(user_id, limit=limit)}
 
@@ -1036,7 +1047,7 @@ async def list_reports(
     offset: int = Query(0, ge=0),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Lista relatórios por empresa e período sem expor IDs internos."""
+    """Lista relatÃ³rios por empresa e perÃ­odo sem expor IDs internos."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         return ReportService.list_reports_filtered(
@@ -1061,7 +1072,7 @@ async def export_filtered_report(
     period_to: datetime | None = Query(None, alias="to"),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exporta relatórios por filtro de empresa/período (CSV ou PDF)."""
+    """Exporta relatÃ³rios por filtro de empresa/perÃ­odo (CSV ou PDF)."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         return ReportService.export_filtered(
@@ -1105,12 +1116,12 @@ async def export_latest_report(
     report_format: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Compatibilidade com o frontend: exporta CSV/PDF da última busca concluída."""
+    """Compatibilidade com o frontend: exporta CSV/PDF da Ãºltima busca concluÃ­da."""
     db = get_db()
     user_id = str(current_user.get("_id") or current_user.get("id"))
     last = db.search_jobs.find_one({"user_id": user_id, "status": "completed"}, sort=[("created_at", -1)])
     if not last:
-        raise HTTPException(status_code=404, detail="Nenhuma busca concluída para exportar")
+        raise HTTPException(status_code=404, detail="Nenhuma busca concluÃ­da para exportar")
 
     search_id = last["search_id"]
     if report_format == "csv":
@@ -1118,7 +1129,7 @@ async def export_latest_report(
     if report_format == "pdf":
         return ReportService.export_pdf(user_id, search_id)
 
-    raise HTTPException(status_code=400, detail="Formato inválido. Use csv ou pdf")
+    raise HTTPException(status_code=400, detail="Formato invÃ¡lido. Use csv ou pdf")
 
 
 @app.get("/api/insights/export/markdown")
@@ -1195,7 +1206,7 @@ async def export_insights_pdf(
 
 @app.delete("/api/dev/clear-data")
 async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
-    """Limpa dados do usuário logado.
+    """Limpa dados do usuÃ¡rio logado.
 
     Uso apenas em desenvolvimento/testes.
     """
@@ -1222,7 +1233,7 @@ async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
         collection = getattr(db, collection_name)
         collection.delete_many({"user_id": user_id})
     db.dashboard_settings.delete_many({"user_id": user_id})
-    return {"ok": True, "message": "Dados do usuário removidos"}
+    return {"ok": True, "message": "Dados do usuÃ¡rio removidos"}
 
 # ==================== DATA MANAGEMENT (DELETE) ====================
 
@@ -1234,7 +1245,7 @@ async def delete_conversation(id: str, current_user: dict[str, Any] = Depends(ge
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not deleted:
-        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+        raise HTTPException(status_code=404, detail="Conversa nÃ£o encontrada")
     return {"ok": True}
 
 @app.delete("/api/conversations/{id}/messages/{msg_id}")
@@ -1245,7 +1256,7 @@ async def delete_message(id: str, msg_id: str, current_user: dict[str, Any] = De
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not deleted:
-        raise HTTPException(status_code=404, detail="Mensagem não encontrada")
+        raise HTTPException(status_code=404, detail="Mensagem nÃ£o encontrada")
     return {"ok": True}
 
 @app.delete("/api/conversations/all")
@@ -1260,7 +1271,7 @@ async def delete_search(id: str, current_user: dict[str, Any] = Depends(get_curr
     db = get_db()
     result = db.search_jobs.delete_one({"search_id": id, "user_id": user_id})
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Pesquisa não encontrada")
+        raise HTTPException(status_code=404, detail="Pesquisa nÃ£o encontrada")
     db.mentions.delete_many({"search_id": id, "user_id": user_id})
     return {"ok": True}
 
@@ -1305,7 +1316,7 @@ async def delete_all_user_data(
         }
     )
 
-    return {"ok": True, "message": "Todos os dados do usuário foram apagados com sucesso"}
+    return {"ok": True, "message": "Todos os dados do usuÃ¡rio foram apagados com sucesso"}
 
 
 # ==================== NPS ====================
@@ -1370,6 +1381,7 @@ async def nps_metrics(
 
 # Routers adicionais para compatibilidade com endpoints especializados.
 app.include_router(mentions_router, prefix="/api/mentions")
-app.include_router(metrics_router, prefix="/api/metrics", tags=["Métricas"])
+app.include_router(metrics_router, prefix="/api/metrics", tags=["MÃ©tricas"])
 app.include_router(reports_router, prefix="/api/reports-admin")
 app.include_router(admin_router, prefix="/api/admin")
+
