@@ -228,7 +228,7 @@ class ChatService:
             {
                 "role": "system",
                 "content": (
-                    "DADOS AUTORIZADOS DO USUÃRIO:\n"
+                    "DADOS AUTORIZADOS DO USUARIO:\n"
                     f"{json.dumps(authorized_context, ensure_ascii=False, default=str)}"
                 ),
             },
@@ -253,12 +253,7 @@ class ChatService:
                     }
                 },
             )
-            detail = "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
-            if isinstance(exc, HTTPException):
-                detail = str(exc.detail or detail)
-            raise ChatUnavailableError(
-                detail
-            ) from exc
+            raise ChatUnavailableError("LLM temporariamente indisponivel.") from exc
 
         if not isinstance(assistant_content, str) or not assistant_content.strip():
             db.chat_threads.update_one(

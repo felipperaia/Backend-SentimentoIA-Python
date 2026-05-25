@@ -580,14 +580,154 @@ async def search_mentions(
         )
 
     latest = snapshots[0]
+    search_id = f"seed_{uuid4().hex}"
+    mentions_raw = latest.get("mentions", []) if isinstance(latest.get("mentions"), list) else []
+    metrics = latest.get("metrics", {}) if isinstance(latest.get("metrics"), dict) else {}
+    company_name = str(latest.get("company_name") or payload.brand_name or "").strip() or payload.brand_name
+    company_slug = str(latest.get("company_slug") or brand_slug).strip().lower() or brand_slug
+    now = datetime.utcnow()
+
+    def _parse_date(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                return now
+        return now
+
+    def _normalize_sentiment(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"positivo", "positive", "pos"}:
+            return "positivo"
+        if raw in {"negativo", "negative", "neg"}:
+            return "negativo"
+        return "neutro"
+
+    def _urgency_score(value: Any) -> float:
+        raw = str(value or "").strip().lower()
+        if raw in {"critical", "critica", "crítica"}:
+            return 1.0
+        if raw in {"high", "alta"}:
+            return 0.8
+        if raw in {"medium", "media", "média"}:
+            return 0.5
+        if raw in {"low", "baixa"}:
+            return 0.2
+        try:
+            return max(0.0, min(float(value), 1.0))
+        except (TypeError, ValueError):
+            return 0.5
+
+    def _criticality_from_score(score: float) -> str:
+        if score >= 0.8:
+            return "alta"
+        if score >= 0.5:
+            return "media"
+        return "baixa"
+
+    mentions_for_primary: list[dict[str, Any]] = []
+    for item in mentions_raw:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+
+        sentiment = _normalize_sentiment(item.get("sentiment"))
+        score = _urgency_score(item.get("urgency"))
+        aspect = str(item.get("aspect") or "").strip().lower()
+        aspects = [aspect] if aspect else []
+        published_at = _parse_date(item.get("date") or latest.get("period_to"))
+
+        mentions_for_primary.append(
+            {
+                "search_id": search_id,
+                "user_id": user_id,
+                "query": company_name,
+                "brand_name": company_name,
+                "company_name": company_name,
+                "company_slug": company_slug,
+                "source": str(item.get("source") or "web").strip().lower() or "web",
+                "text": text[:5000],
+                "sentiment": sentiment,
+                "urgency_score": round(score, 4),
+                "criticality": _criticality_from_score(score),
+                "confidence_score": 0.8,
+                "aspects": aspects,
+                "aspect_sentiment": {aspect: sentiment} if aspect else {},
+                "status": "processed",
+                "published_at": published_at,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+    db = get_db()
+    if db is not None:
+        if payload.replace_existing:
+            db.mentions.delete_many(
+                {
+                    "user_id": user_id,
+                    "company_slug": company_slug,
+                    "search_id": {"$regex": "^seed_"},
+                }
+            )
+        if mentions_for_primary:
+            db.mentions.insert_many(mentions_for_primary)
+
+        db.search_jobs.update_one(
+            {"user_id": user_id, "search_id": search_id},
+            {
+                "$set": {
+                    "search_id": search_id,
+                    "user_id": user_id,
+                    "query": company_name.lower(),
+                    "company_name": company_name,
+                    "company_slug": company_slug,
+                    "period_days": int(payload.period_days or 30),
+                    "locality": payload.locality or "",
+                    "sources": ["secondary_mongodb"],
+                    "status": "completed",
+                    "total": len(mentions_for_primary),
+                    "metrics": metrics,
+                    "errors": [],
+                    "status_summary": {
+                        "status": "success" if mentions_for_primary else "empty",
+                        "partial_success": False,
+                        "sources_requested": 1,
+                        "sources_with_data": 1 if mentions_for_primary else 0,
+                        "sources_failed": 0,
+                        "source_status": [
+                            {
+                                "source": "secondary_mongodb",
+                                "ok": bool(mentions_for_primary),
+                                "count": len(mentions_for_primary),
+                                "error": None,
+                                "reason": None,
+                                "timeout": False,
+                            }
+                        ],
+                    },
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+        )
+
     # Retorna no mesmo formato que o frontend espera do search antigo
     return {
-        "search_id": str(latest.get("_id", "")),
-        "brand_name": latest.get("company_name"),
-        "company_slug": latest.get("company_slug"),
+        "search_id": search_id,
+        "brand_name": company_name,
+        "company_slug": company_slug,
         "status": "completed",
-        "mentions": latest.get("mentions", []),
-        "metrics": latest.get("metrics", {}),
+        "mentions": mentions_raw,
+        "metrics": metrics,
         "insights": latest.get("insights", []),
         "period_label": latest.get("period_label", ""),
         "period_from": str(latest.get("period_from", "")),
