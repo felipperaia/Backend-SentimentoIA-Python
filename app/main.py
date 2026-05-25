@@ -282,7 +282,7 @@ async def add_security_headers(request: Request, call_next):
 
 app.include_router(auth_router, prefix="/api/auth", tags=["AutenticaÃ§Ã£o"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
-app.include_router(demo_router, prefix="/api/demo", tags=["Demo"])
+app.include_router(demo_router, prefix="/api/demo/seed", tags=["Demo"])
 app.include_router(companies_router, prefix="/api", tags=["Empresas"])
 
 
