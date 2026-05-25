@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from datetime import timedelta
 from typing import Any
 
@@ -8,9 +9,28 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.auth_utils import get_current_user
 from app.database import get_db
+from app.services.dashboard_service import DashboardService
 from app.services.normalization_service import utcnow
 
 router = APIRouter()
+
+
+@router.get("")
+@router.get("/")
+async def aggregated_metrics(
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    return DashboardService.aggregate_metrics(
+        user_id=user_id,
+        company_slug=company_slug or company_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
 
 
 def _normalize_sentiment(value: Any) -> str:

@@ -4,6 +4,7 @@
 
 # Documentation
 /docs
+/examples
 
 # Python virtual environments
 **/venv/

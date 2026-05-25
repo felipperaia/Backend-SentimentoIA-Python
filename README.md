@@ -71,11 +71,27 @@ cp .env.example .env
 
 - `MONGODB_URI`
 - `DATABASE_NAME`
+- `SECONDARY_MONGODB_URI` (seed/demo)
+- `SECONDARY_DATABASE_NAME` (seed/demo)
 - `SECRET_KEY`
 - `FRONTEND_URL`
 - `CORS_ORIGINS_CSV`
 - `OLLAMA_BASE_URL` (se usar IA)
 - `OLLAMA_MODEL` (se usar IA)
+
+## Fluxo de Seeds (Demo)
+
+Fluxo recomendado para o frontend:
+
+1. Tela Configuracoes chama `POST /api/demo/seed` com payload de seed.
+2. API grava snapshots no MongoDB secundario.
+3. API sincroniza contexto demo no MongoDB principal (`demo_context_links`, `search_jobs` e `insights`).
+4. Tela Dashboard chama `GET /api/dashboard?mode=demo` para montar dados demo.
+5. A consulta de dashboard demo reforca a sincronizacao no banco principal para manter vinculo por `context_id`.
+
+Arquivo de exemplo para payload:
+
+- `examples/demo-seed-payload.example.json`
 
 ## Como executar
 

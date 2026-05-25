@@ -357,11 +357,19 @@ class ChatService:
                 ) from exc
 
             if not isinstance(assistant_content, str) or not assistant_content.strip():
-                assistant_content = ChatService._temporary_unavailable_message(locale=locale)
-                assistant_metadata = {
-                    "out_of_scope": False,
-                    "fallback_reason": "empty_or_invalid_llm_response",
-                }
+                db.chat_threads.update_one(
+                    {"_id": thread_id, "user_id": user_id},
+                    {
+                        "$set": {
+                            "locale": locale,
+                            "updated_at": now,
+                            "last_message_at": now,
+                        }
+                    },
+                )
+                raise ChatUnavailableError(
+                    "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
+                )
 
         now_response = utcnow()
         assistant_id = f"cmsg_{now_response.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"

@@ -583,12 +583,12 @@ class LLMService:
         fail_on_unavailable: bool = False,
         **legacy_kwargs: Any,
     ) -> str:
-        del fail_on_unavailable
-
         fallback = "Desculpe, o assistente esta temporariamente indisponivel."
 
         if not LLMService.ollama_configured():
             logger.warning("Chat LLM indisponivel por configuracao ausente")
+            if fail_on_unavailable:
+                raise RuntimeError("LLM nao configurada")
             return fallback
 
         try:
@@ -613,7 +613,11 @@ class LLMService:
                     rendered_prompt,
                     model=legacy_kwargs.get("model") or LLMService._model(),
                 )
-                return response if response else fallback
+                if response:
+                    return response
+                if fail_on_unavailable:
+                    raise RuntimeError("Resposta vazia da LLM")
+                return fallback
 
             safe_context = LLMService.sanitize_context(authorized_context or {})
             safe_messages: list[dict[str, str]] = []
@@ -641,6 +645,8 @@ class LLMService:
                 safe_messages.append({"role": role, "content": content[:6000]})
 
             if not safe_messages:
+                if fail_on_unavailable:
+                    raise RuntimeError("Payload de chat invalido")
                 return fallback
 
             prompt_parts = [f"{item.get('role', 'user').upper()}:\n{item.get('content', '')}" for item in safe_messages]
@@ -651,10 +657,14 @@ class LLMService:
             )
             if not response:
                 logger.warning("Chat LLM retornou vazio; fallback aplicado")
+                if fail_on_unavailable:
+                    raise RuntimeError("Resposta vazia da LLM")
                 return fallback
             return response
         except Exception as exc:
             logger.warning("Falha no chat Ollama; fallback aplicado: %s", exc)
+            if fail_on_unavailable:
+                raise RuntimeError("Falha de conectividade com a LLM") from exc
             return fallback
 
     @staticmethod

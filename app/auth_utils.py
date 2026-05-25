@@ -94,3 +94,20 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+def get_optional_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict[str, Any] | None:
+    if credentials is None:
+        return None
+
+    try:
+        payload = decode_access_token(credentials.credentials)
+    except HTTPException:
+        return None
+
+    user = AuthService.get_user_by_id(str(payload.get("sub") or ""))
+    if not user or not user.get("is_active", True):
+        return None
+    return user

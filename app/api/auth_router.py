@@ -219,6 +219,31 @@ async def update_profile(payload: UserProfileUpdate, current_user: CurrentUser, 
     return serialize_user(updated)
 
 
+@router.delete("/me")
+async def delete_me(
+    current_user: CurrentUser,
+    hard_delete: bool = False,
+    delete_related_data: bool = True,
+):
+    """Exclui a conta do usuário autenticado e dados relacionados (quando habilitado)."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+
+    try:
+        result = AuthService.delete_user_account(
+            user_id=user_id,
+            hard_delete=bool(hard_delete),
+            delete_related_data=bool(delete_related_data),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return {
+        "status": "deleted",
+        "mode": result.get("status"),
+        "related_data_deleted": bool(result.get("related_data_deleted", False)),
+    }
+
+
 @router.post("/change-password", response_model=PasswordResetResponse)
 async def change_password(payload: ChangePasswordRequest, current_user: CurrentUser, request: Request):
     try:

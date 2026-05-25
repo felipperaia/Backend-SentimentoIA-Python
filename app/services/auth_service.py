@@ -14,7 +14,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 
 from app.config import settings
-from app.database import get_db
+from app.database import get_db, get_secondary_db
 from app.schemas import UserCreate, UserRole
 
 logger = logging.getLogger(__name__)
@@ -440,6 +440,104 @@ class AuthService:
 
         logger.info("✓ Senha redefinida com sucesso para usuário: %s", user.get("email"))
         return True
+
+    @staticmethod
+    def delete_user_account(
+        user_id: str,
+        *,
+        hard_delete: bool = False,
+        delete_related_data: bool = True,
+    ) -> dict:
+        """Desativa/removo usuário e limpa dados relacionados quando solicitado."""
+        db = get_db()
+
+        try:
+            object_id = ObjectId(user_id)
+        except (InvalidId, TypeError) as exc:
+            raise ValueError("Usuário inválido") from exc
+
+        user = db.users.find_one({"_id": object_id})
+        if not user:
+            raise ValueError("Usuário não encontrado")
+
+        deleted_counts: dict[str, int] = {}
+        if delete_related_data:
+            collection_names = [
+                "search_jobs",
+                "searchjobs",
+                "mentions",
+                "insights",
+                "insight_jobs",
+                "chat_threads",
+                "chatthreads",
+                "chat_messages",
+                "chatmessages",
+                "reports",
+                "alerts",
+                "comment_batches",
+                "dashboard_settings",
+                "dashboardsettings",
+                "nps_responses",
+                "privacyconsents",
+                "user_consents",
+            ]
+            existing = set(db.list_collection_names())
+
+            for collection_name in collection_names:
+                if collection_name not in existing:
+                    continue
+                result = db[collection_name].delete_many({"user_id": user_id})
+                deleted_counts[collection_name] = int(result.deleted_count)
+
+            # Consentimentos anonimos podem carregar userid legado em vez de user_id.
+            if "privacyconsents" in existing:
+                legacy_result = db.privacyconsents.delete_many({"userid": user_id})
+                deleted_counts["privacyconsents"] = deleted_counts.get("privacyconsents", 0) + int(
+                    legacy_result.deleted_count
+                )
+
+            # Dados demo em banco secundário (quando configurado).
+            try:
+                secondary_db = get_secondary_db()
+                result = secondary_db.demo_dashboard_snapshots.delete_many({"user_id": user_id})
+                deleted_counts["demo_dashboard_snapshots"] = int(result.deleted_count)
+            except RuntimeError:
+                pass
+
+        now = AuthService.utcnow()
+        if hard_delete:
+            db.users.delete_one({"_id": object_id})
+            account_status = "hard_deleted"
+        else:
+            db.users.update_one(
+                {"_id": object_id},
+                {
+                    "$set": {
+                        "is_active": False,
+                        "deleted_at": now,
+                        "updated_at": now,
+                        "mfa_enabled": False,
+                        "mfa_verified": False,
+                        "mfa_secret": None,
+                    }
+                },
+            )
+            account_status = "soft_deleted"
+
+        AuthService.log_audit(
+            user_id=user_id,
+            action="user_account_deleted",
+            details={
+                "mode": account_status,
+                "related_data_deleted": bool(delete_related_data),
+            },
+        )
+
+        return {
+            "status": account_status,
+            "related_data_deleted": bool(delete_related_data),
+            "deleted_counts": deleted_counts,
+        }
     
     @staticmethod
     def log_audit(

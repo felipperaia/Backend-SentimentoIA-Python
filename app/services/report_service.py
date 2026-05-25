@@ -1,15 +1,30 @@
 import csv
+import hashlib
 import io
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 from fastapi.responses import Response, StreamingResponse
 
 from app.database import get_db
+from app.services.company_utils import normalize_company_filter, slugify_company
+from app.services.search_service import SearchService
 
 
 class ReportService:
     """Exportação real CSV/PDF baseada no MongoDB, compatível com search_id e batch_id."""
+
+    @staticmethod
+    def _sort_timestamp(value: Any) -> float:
+        if isinstance(value, datetime):
+            try:
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=timezone.utc).timestamp()
+                return value.timestamp()
+            except Exception:
+                return 0.0
+        return 0.0
 
     @staticmethod
     def _load_reportlab_components() -> dict[str, Any] | None:
@@ -417,3 +432,361 @@ class ReportService:
             media_type="application/pdf",
             headers={"Content-Disposition": 'attachment; filename="insights.pdf"'},
         )
+
+    @staticmethod
+    def _company_regex_from_slug(company_slug: str) -> str:
+        escaped = re.escape(company_slug).replace("\\-", "[-_\\s]*")
+        return f"^{escaped}$"
+
+    @staticmethod
+    def _resolve_search_jobs(
+        db,
+        user_id: str,
+        *,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        resolved_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_id)
+
+        query: dict[str, Any] = {
+            "user_id": user_id,
+            "status": "completed",
+        }
+
+        if period_from or period_to:
+            date_query: dict[str, Any] = {}
+            if period_from:
+                date_query["$gte"] = period_from
+            if period_to:
+                date_query["$lte"] = period_to
+            query["created_at"] = date_query
+
+        if resolved_company_slug:
+            company_regex = ReportService._company_regex_from_slug(resolved_company_slug)
+            query["$or"] = [
+                {"company_slug": resolved_company_slug},
+                {"query": {"$regex": company_regex, "$options": "i"}},
+                {"company_name": {"$regex": company_regex, "$options": "i"}},
+                {"brand": {"$regex": company_regex, "$options": "i"}},
+            ]
+
+        jobs: list[dict[str, Any]] = []
+        for collection_name in ["search_jobs", "searchjobs"]:
+            if collection_name not in db.list_collection_names():
+                continue
+            jobs.extend(
+                list(
+                    db[collection_name].find(
+                        query,
+                        {
+                            "search_id": 1,
+                            "query": 1,
+                            "company_name": 1,
+                            "company_slug": 1,
+                            "created_at": 1,
+                            "updated_at": 1,
+                        },
+                    )
+                )
+            )
+
+        unique_by_search: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            search_id = str(job.get("search_id") or "").strip()
+            if not search_id:
+                continue
+            if search_id not in unique_by_search:
+                unique_by_search[search_id] = job
+
+        ordered = sorted(
+            unique_by_search.values(),
+            key=lambda item: ReportService._sort_timestamp(item.get("created_at")),
+            reverse=True,
+        )
+        return ordered
+
+    @staticmethod
+    def _mentions_query_for_search_ids(
+        *,
+        user_id: str,
+        search_ids: list[str],
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {
+            "user_id": user_id,
+            "$or": [
+                {"search_id": {"$in": search_ids}},
+                {"batch_id": {"$in": search_ids}},
+            ],
+        }
+
+        if period_from or period_to:
+            date_filter: dict[str, Any] = {}
+            if period_from:
+                date_filter["$gte"] = period_from
+            if period_to:
+                date_filter["$lte"] = period_to
+            query["created_at"] = date_filter
+
+        return query
+
+    @staticmethod
+    def list_reports_filtered(
+        user_id: str,
+        *,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        db = get_db()
+        if db is None:
+            raise RuntimeError("Banco de dados indisponivel")
+
+        jobs = ReportService._resolve_search_jobs(
+            db=db,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+        )
+
+        safe_limit = max(1, min(int(limit), 200))
+        safe_offset = max(0, int(offset))
+        paged = jobs[safe_offset : safe_offset + safe_limit]
+
+        items: list[dict[str, Any]] = []
+        for job in paged:
+            search_id = str(job.get("search_id") or "")
+            mentions = list(
+                db.mentions.find(
+                    {
+                        "user_id": user_id,
+                        "$or": [{"search_id": search_id}, {"batch_id": search_id}],
+                    },
+                    {"published_at": 1, "created_at": 1},
+                )
+            )
+
+            values = [
+                item.get("published_at") or item.get("created_at")
+                for item in mentions
+                if isinstance(item.get("published_at") or item.get("created_at"), datetime)
+            ]
+            period_start = min(values).isoformat() if values else None
+            period_end = max(values).isoformat() if values else None
+
+            name = str(job.get("company_name") or job.get("query") or "").strip() or "Empresa"
+            slug = normalize_company_filter(
+                company_slug=str(job.get("company_slug") or "") or None,
+                company_id=name,
+            )
+            if not slug:
+                slug = slugify_company(name)
+
+            items.append(
+                {
+                    "report_id": f"report_{hashlib.sha256(search_id.encode('utf-8')).hexdigest()[:16]}",
+                    "company_name": name,
+                    "company_slug": slug,
+                    "period_from": period_start,
+                    "period_to": period_end,
+                    "created_at": job.get("created_at"),
+                    "report_type": "executive",
+                }
+            )
+
+        return {
+            "total": len(jobs),
+            "limit": safe_limit,
+            "offset": safe_offset,
+            "items": SearchService.serialize_many(items),
+        }
+
+    @staticmethod
+    def _export_csv_mentions(mentions: list[dict[str, Any]], file_label: str) -> StreamingResponse:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "search_id",
+                "query",
+                "source",
+                "author",
+                "published_at",
+                "rating",
+                "sentiment",
+                "confidence",
+                "criticality",
+                "urgency_score",
+                "reputation_score",
+                "aspects",
+                "url",
+                "text",
+            ]
+        )
+
+        for mention in mentions:
+            writer.writerow(
+                [
+                    mention.get("search_id") or mention.get("batch_id") or "",
+                    mention.get("query") or mention.get("company_name") or mention.get("entity") or "",
+                    mention.get("source") or "",
+                    mention.get("author") or "",
+                    mention.get("published_at") or mention.get("created_at") or "",
+                    mention.get("rating") or "",
+                    mention.get("sentiment") or "",
+                    mention.get("confidence") or mention.get("confidence_score") or "",
+                    mention.get("criticality") or "",
+                    mention.get("urgency_score") or "",
+                    mention.get("reputation_score") or "",
+                    ";".join(mention.get("aspects") or []),
+                    mention.get("url") or "",
+                    (mention.get("text") or "").replace("\n", " "),
+                ]
+            )
+
+        content = buffer.getvalue().encode("utf-8-sig")
+        return StreamingResponse(
+            io.BytesIO(content),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{file_label}.csv"'},
+        )
+
+    @staticmethod
+    def _export_pdf_mentions(mentions: list[dict[str, Any]], file_label: str) -> Response:
+        reportlab = ReportService._load_reportlab_components()
+        if reportlab is None:
+            return Response(
+                content="Exportacao PDF indisponivel neste ambiente (dependencia reportlab ausente).",
+                media_type="text/plain",
+                status_code=503,
+            )
+
+        colors = reportlab["colors"]
+        A4 = reportlab["A4"]
+        getSampleStyleSheet = reportlab["getSampleStyleSheet"]
+        Paragraph = reportlab["Paragraph"]
+        SimpleDocTemplate = reportlab["SimpleDocTemplate"]
+        Spacer = reportlab["Spacer"]
+        Table = reportlab["Table"]
+        TableStyle = reportlab["TableStyle"]
+
+        from app.services.enrichment_service import EnrichmentService
+
+        metrics = EnrichmentService.aggregate(mentions) if mentions else {}
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+        styles = getSampleStyleSheet()
+        story: list[Any] = []
+
+        story.append(Paragraph("Relatorio Consolidado", styles["Title"]))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"Gerado em: {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')}", styles["Normal"]))
+        story.append(Spacer(1, 8))
+
+        table_data = [
+            ["Metrica", "Valor"],
+            ["Total de mencoes", str(metrics.get("total_mentions", len(mentions)))],
+            ["Score de reputacao", str(metrics.get("reputation_score", 0))],
+            ["Tendencia", str(metrics.get("trend") or "indefinido")],
+            ["Mencoes criticas", str(metrics.get("critical_mentions", 0))],
+        ]
+        table = Table(table_data, colWidths=[220, 220])
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ]
+            )
+        )
+        story.append(table)
+        story.append(Spacer(1, 12))
+
+        sample = [["Fonte", "Autor", "Sentimento", "Texto"]]
+        for mention in mentions[:20]:
+            sample.append(
+                [
+                    str(mention.get("source", ""))[:20],
+                    str(mention.get("author", ""))[:20],
+                    str(mention.get("sentiment", ""))[:16],
+                    str(mention.get("text", ""))[:120],
+                ]
+            )
+        sample_table = Table(sample, colWidths=[60, 90, 70, 260])
+        sample_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(sample_table)
+
+        doc.build(story)
+        payload = buffer.getvalue()
+        buffer.close()
+
+        return Response(
+            content=payload,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{file_label}.pdf"'},
+        )
+
+    @staticmethod
+    def export_filtered(
+        user_id: str,
+        *,
+        report_format: str,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+    ) -> StreamingResponse | Response:
+        db = get_db()
+        if db is None:
+            raise RuntimeError("Banco de dados indisponivel")
+
+        jobs = ReportService._resolve_search_jobs(
+            db=db,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+        )
+        if not jobs:
+            raise ValueError("Nenhum relatório disponível para o filtro informado")
+
+        search_ids = [str(job.get("search_id") or "").strip() for job in jobs if job.get("search_id")]
+        if not search_ids:
+            raise ValueError("Nenhuma busca correspondente foi encontrada")
+
+        mentions_query = ReportService._mentions_query_for_search_ids(
+            user_id=user_id,
+            search_ids=search_ids,
+            period_from=period_from,
+            period_to=period_to,
+        )
+        mentions = list(db.mentions.find(mentions_query, {"raw": 0}).sort("created_at", -1))
+
+        normalized_format = str(report_format or "").strip().lower()
+        file_label = "relatorio-filtrado"
+        if normalized_format == "csv":
+            return ReportService._export_csv_mentions(mentions=mentions, file_label=file_label)
+        if normalized_format == "pdf":
+            return ReportService._export_pdf_mentions(mentions=mentions, file_label=file_label)
+
+        raise ValueError("Formato invalido. Use csv ou pdf")

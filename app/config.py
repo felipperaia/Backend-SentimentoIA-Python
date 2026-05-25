@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     # DB
     mongodb_uri: str
     database_name: str = "sentimento_db"
+    secondary_mongodb_uri: str | None = None
+    secondary_database_name: str | None = None
 
     # CORS
     cors_origins_csv: str = "https://sentimento-ai.netlify.app"
@@ -147,6 +149,8 @@ class Settings(BaseSettings):
         "SCRAPER_RETRY_ATTEMPTS": "scraper_retry_attempts",
         "SCRAPER_RETRY_BACKOFF_SECONDS": "scraper_retry_backoff_seconds",
         "SCRAPER_TIMEOUT_SECONDS": "scraper_timeout_seconds",
+        "SECONDARY_DATABASE_NAME": "secondary_database_name",
+        "SECONDARY_MONGODB_URI": "secondary_mongodb_uri",
         "SECRET_KEY": "secret_key",
         "SMTP_EFFECTIVE_FROM_EMAIL": "smtp_from_email",
         "SMTP_EFFECTIVE_USERNAME": "smtp_user",

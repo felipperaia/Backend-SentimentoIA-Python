@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from app.database import get_db
 from app.schemas.ingestion import IngestionBatchRequest, IngestionBatchResponse, IngestionBatchSummary, IngestionRejectedItem
+from app.services.company_utils import slugify_company
 from app.services.normalization_service import normalize_mention, utcnow
 from app.services.search_service import SearchService
 
@@ -38,6 +39,8 @@ class IngestionService:
         now = utcnow()
         batch_id = IngestionService._batch_id()
         received = len(payload.comments)
+        company_name = str(payload.brand or "").strip()
+        company_slug = slugify_company(company_name)
 
         batch_doc = {
             "batch_id": batch_id,
@@ -46,6 +49,8 @@ class IngestionService:
             "source": payload.source,
             "channel": payload.channel,
             "brand": payload.brand,
+            "company_name": company_name,
+            "company_slug": company_slug,
             "locale": payload.locale,
             "status": "queued",
             "received_count": received,
@@ -131,6 +136,8 @@ class IngestionService:
                     "status": "pending",
                     "external_id": comment.external_id,
                     "brand": payload.brand,
+                    "company_name": company_name,
+                    "company_slug": company_slug,
                     "channel": payload.channel,
                     "locale": payload.locale,
                     "author_name": comment.author_name,

@@ -4,6 +4,7 @@ from typing import Any
 
 from app.config import settings
 from app.database import get_db
+from app.services.company_utils import slugify_company
 from app.services.collector_service import CollectorService
 from app.services.enrichment_service import EnrichmentService
 from app.services.llm_service import LLMService
@@ -188,6 +189,8 @@ class SearchService:
     ) -> dict[str, Any]:
         db = get_db()
         now = utcnow()
+        company_name = str(query or "").strip()
+        company_slug = slugify_company(company_name)
 
         # Cache inteligente: se busca igual existir dentro do TTL, retorna o resultado salvo.
         cache_key = {
@@ -238,6 +241,8 @@ class SearchService:
         db.search_jobs.insert_one({
             "search_id": search_id,
             **cache_key,
+            "company_name": company_name,
+            "company_slug": company_slug,
             "status": "running",
             "created_at": now,
             "updated_at": now,
@@ -286,6 +291,8 @@ class SearchService:
                 "search_id": search_id,
                 "user_id": user_id,
                 "query": query,
+                "company_name": company_name,
+                "company_slug": company_slug,
                 "urgency_score": round(urgency_score, 4),
                 "criticality": criticality,
                 "confidence_score": round(float(enrichment.get("confidence", 0.55) or 0.55), 3),

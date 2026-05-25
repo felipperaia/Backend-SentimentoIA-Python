@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -15,15 +16,23 @@ from slowapi.util import get_remote_address
 
 from app.api.admin_router import router as admin_router
 from app.api.auth_router import router as auth_router
+from app.api.companies_router import router as companies_router
+from app.api.demo_router import router as demo_router
 from app.api.ingestion_router import router as ingestion_router
 from app.api.metrics_router import router as metrics_router
 from app.api.mentions_router import router as mentions_router
 from app.api.reports_router import router as reports_router
-from app.auth_utils import decode_access_token, get_current_user
+from app.auth_utils import decode_access_token, get_current_user, get_optional_current_user
 from app.config import settings
 from app.database import connect_db, disconnect_db, get_db
 from app.models import ScrapeRequest, SearchRequest
-from app.schemas import ChatMessageCreateRequest, ChatThreadCreateRequest, UserSettingsUpdateRequest
+from app.schemas import (
+    ChatMessageCreateRequest,
+    ChatThreadCreateRequest,
+    PrivacyConsentResponse,
+    PrivacyConsentUpsertRequest,
+    UserSettingsUpdateRequest,
+)
 from app.services.chat_service import ChatService, ChatUnavailableError
 from app.services.dashboard_service import DashboardService
 from app.services.enrichment_service import EnrichmentService
@@ -82,12 +91,6 @@ class NpsDismissRequest(BaseModel):
     session_id: str
     module_key: str = "geral"
     route: str | None = None
-
-
-class PrivacyConsentRequest(BaseModel):
-    session_id: str
-    analytics: bool
-    marketing: bool
 
 
 INTERNAL_ERROR_MARKERS = (
@@ -301,6 +304,8 @@ async def add_security_headers(request: Request, call_next):
 
 app.include_router(auth_router, prefix="/api/auth", tags=["Autenticação"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
+app.include_router(demo_router, prefix="/api/demo", tags=["Demo"])
+app.include_router(companies_router, prefix="/api", tags=["Empresas"])
 
 
 @app.exception_handler(HTTPException)
@@ -375,31 +380,122 @@ async def privacy_rights():
 
 @app.post("/api/privacy/consent")
 async def privacy_consent(
-    payload: PrivacyConsentRequest,
+    payload: PrivacyConsentUpsertRequest,
     request: Request,
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] | None = Depends(get_optional_current_user),
 ):
     db = get_db()
     if db is None:
         raise HTTPException(status_code=503, detail="Banco de dados indisponivel")
 
-    user_id = str(current_user.get("_id") or current_user.get("id"))
+    user_id = str(current_user.get("_id") or current_user.get("id")) if current_user else None
+    if not user_id and not payload.session_id:
+        raise HTTPException(status_code=400, detail="Informe session_id quando não autenticado")
+
+    preferences = payload.normalized_preferences()
+    consent = payload.resolved_consent()
+    version = str(payload.version or "1.0")
     ip_hash = _hash_ip_prefix(request.client.host if request.client else None)
     user_agent_hash = _hash_user_agent(request.headers.get("user-agent"))
+    now = utcnow()
+
+    filter_query: dict[str, Any]
+    if user_id:
+        filter_query = {"user_id": user_id}
+    else:
+        filter_query = {
+            "session_id": str(payload.session_id or "").strip(),
+            "ip_hash": ip_hash,
+        }
 
     consent_doc = {
-        "userid": user_id,
         "user_id": user_id,
-        "session_id": payload.session_id,
-        "analytics": bool(payload.analytics),
-        "marketing": bool(payload.marketing),
+        "userid": user_id,
+        "session_id": str(payload.session_id or "").strip() or None,
+        "consent": consent,
+        "version": version,
+        "preferences": preferences,
+        "analytics": bool(preferences.get("cookies_analiticos", False)),
+        "marketing": bool(preferences.get("cookies_personalizacao", False)),
         "ip_hash": ip_hash,
-        "created_at": utcnow(),
+        "updated_at": now,
         "user_agent_hash": user_agent_hash,
     }
-    db.user_consents.insert_one(consent_doc)
 
-    return {"ok": True}
+    db.privacyconsents.update_one(
+        filter_query,
+        {
+            "$set": consent_doc,
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+    return PrivacyConsentResponse(
+        consent=consent,
+        preferences=preferences,
+        version=version,
+        session_id=consent_doc.get("session_id"),
+        user_id=user_id,
+        created_at=now,
+        updated_at=now,
+    ).model_dump()
+
+
+@app.get("/api/privacy/consent")
+async def get_privacy_consent(
+    session_id: str | None = Query(None),
+    current_user: dict[str, Any] | None = Depends(get_optional_current_user),
+):
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Banco de dados indisponivel")
+
+    user_id = str(current_user.get("_id") or current_user.get("id")) if current_user else None
+
+    query: dict[str, Any] = {}
+    if user_id:
+        query = {"user_id": user_id}
+    elif session_id:
+        query = {"session_id": session_id}
+    else:
+        raise HTTPException(status_code=400, detail="Informe session_id quando não autenticado")
+
+    doc = db.privacyconsents.find_one(query, sort=[("updated_at", -1), ("created_at", -1)])
+    if not doc:
+        return PrivacyConsentResponse(
+            consent=False,
+            preferences={
+                "cookies_analiticos": False,
+                "cookies_personalizacao": False,
+                "cookies_treinamento_ia": False,
+            },
+            version="1.0",
+            session_id=session_id,
+            user_id=user_id,
+        ).model_dump()
+
+    preferences = doc.get("preferences") if isinstance(doc.get("preferences"), dict) else {}
+    if not preferences:
+        preferences = {
+            "cookies_analiticos": bool(doc.get("analytics", False)),
+            "cookies_personalizacao": bool(doc.get("marketing", False)),
+            "cookies_treinamento_ia": False,
+        }
+
+    return PrivacyConsentResponse(
+        consent=bool(doc.get("consent", any(bool(v) for v in preferences.values()))),
+        preferences={
+            "cookies_analiticos": bool(preferences.get("cookies_analiticos", False)),
+            "cookies_personalizacao": bool(preferences.get("cookies_personalizacao", False)),
+            "cookies_treinamento_ia": bool(preferences.get("cookies_treinamento_ia", False)),
+        },
+        version=str(doc.get("version") or "1.0"),
+        session_id=doc.get("session_id"),
+        user_id=doc.get("user_id"),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+    ).model_dump()
 
 
 @app.get("/api/privacy/export-summary")
@@ -418,6 +514,8 @@ async def privacy_export_summary(current_user: dict[str, Any] = Depends(get_curr
         "nps_responses",
         "alerts",
         "reports",
+        "privacyconsents",
+        "user_consents",
     ]
     summary: dict[str, int] = {}
     total_records = 0
@@ -509,6 +607,11 @@ async def scrape_mentions(request: Request, payload: ScrapeRequest, current_user
 async def dashboard(
     batch_id: str | None = Query(None),
     search_id: str | None = Query(None),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    mode: str = Query("live"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
     period_days: int | None = Query(None, ge=1, le=365),
     limit_mentions: int = Query(200, ge=1, le=1000),
     current_user: dict[str, Any] = Depends(get_current_user),
@@ -516,11 +619,20 @@ async def dashboard(
     """Retorna dashboard do pipeline processado (mentions status=processed)."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     selected_batch_id = batch_id or search_id
+    selected_company_slug = company_slug or company_id
+    normalized_mode = str(mode or "live").strip().lower()
+    if normalized_mode not in {"live", "demo"}:
+        raise HTTPException(status_code=400, detail="Modo invalido. Use live ou demo")
+
     return DashboardService.get_dashboard(
         user_id=user_id,
         batch_id=selected_batch_id,
         period_days=period_days,
         limit_mentions=limit_mentions,
+        mode=normalized_mode,
+        company_slug=selected_company_slug,
+        period_from=period_from,
+        period_to=period_to,
     )
 
 
@@ -530,6 +642,10 @@ async def mentions(
     search_id: str | None = Query(None),
     batch_id_alias: str | None = Query(None, alias="batchId"),
     search_id_alias: str | None = Query(None, alias="searchId"),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
     status: str | None = Query(None),
     sentiment: str | None = Query(None),
     limit: str | None = Query("100"),
@@ -554,12 +670,19 @@ async def mentions(
         status=normalized_status,
         sentiment=normalized_sentiment,
         limit=normalized_limit,
+        company_slug=company_slug or company_id,
+        period_from=period_from,
+        period_to=period_to,
     )
 
 
 @app.get("/api/insights")
 async def insights(
     batch_id: str | None = Query(None),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
     include_archived: bool = Query(False),
     priority: str | None = Query(None),
     resolution: str | None = Query(None),
@@ -573,6 +696,9 @@ async def insights(
         include_archived=include_archived,
         limit=limit,
         batch_id=batch_id,
+        company_slug=company_slug or company_id,
+        period_from=period_from,
+        period_to=period_to,
         priority=priority,
         resolution=resolution,
     )
@@ -877,6 +1003,60 @@ async def alerts(
     return {"alerts": SearchService.serialize_many(data)}
 
 
+@app.get("/api/reports")
+async def list_reports(
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Lista relatórios por empresa e período sem expor IDs internos."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        return ReportService.list_reports_filtered(
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            limit=limit,
+            offset=offset,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/reports/export")
+async def export_filtered_report(
+    report_format: str = Query("csv", alias="format"),
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Exporta relatórios por filtro de empresa/período (CSV ou PDF)."""
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        return ReportService.export_filtered(
+            user_id=user_id,
+            report_format=report_format,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "nenhum" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
 @app.get("/api/reports/csv")
 async def export_csv(
     search_id: str,
@@ -974,6 +1154,8 @@ async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
         "chat_threads",
         "comment_batches",
         "nps_responses",
+        "privacyconsents",
+        "user_consents",
     ]
     for collection_name in collections:
         collection = getattr(db, collection_name)
@@ -1047,7 +1229,7 @@ async def delete_all_user_data(
     collections = [
         "mentions", "search_jobs", "alerts", "reports", "insight_jobs", 
         "insights", "chat_messages", "chat_threads", "comment_batches", 
-        "nps_responses", "scraped_items", "scrape_cache"
+        "nps_responses", "scraped_items", "scrape_cache", "privacyconsents", "user_consents"
     ]
     for coll in collections:
         db[coll].delete_many({"user_id": user_id})

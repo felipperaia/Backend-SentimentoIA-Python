@@ -18,6 +18,8 @@ class MongoDB:
 
     client: Optional[MongoClient] = None
     db = None
+    secondary_client: Optional[MongoClient] = None
+    secondary_db = None
 
     @classmethod
     async def connect_db(cls):
@@ -73,20 +75,50 @@ class MongoDB:
             cls.db.alerts.create_index([("user_id", 1), ("search_id", 1), ("created_at", -1)])
             cls.db.reports.create_index([("user_id", 1), ("search_id", 1), ("created_at", -1)])
             cls.db.audit_logs.create_index([("user_id", 1), ("created_at", -1)])
+            cls.db.demo_context_links.create_index([("user_id", 1), ("context_id", 1)], unique=True)
+            cls.db.demo_context_links.create_index([("user_id", 1), ("company_slug", 1), ("updated_at", -1)])
 
             cls.db.nps_responses.create_index([("user_id", 1), ("created_at", -1)])
             cls.db.nps_responses.create_index([("session_id", 1), ("created_at", -1)])
             cls.db.nps_responses.create_index([("module_key", 1), ("created_at", -1)])
+
+            cls.db.privacyconsents.create_index([("user_id", 1), ("updated_at", -1)])
+            cls.db.privacyconsents.create_index([("session_id", 1), ("updated_at", -1)])
 
             logger.info("✓ Índices criados com sucesso")
 
         except Exception as exc:
             logger.error("✗ Erro ao criar índices: %s", exc)
 
+    @classmethod
+    async def create_secondary_indexes(cls):
+        """Índices para snapshots de dashboard em banco secundário (demo)."""
+        if cls.secondary_db is None:
+            return
+
+        try:
+            snapshots = cls.secondary_db.demo_dashboard_snapshots
+            snapshots.create_index("user_id")
+            snapshots.create_index([("user_id", 1), ("company_slug", 1)])
+            snapshots.create_index([("user_id", 1), ("company_slug", 1), ("period_from", 1), ("period_to", 1)])
+            snapshots.create_index([("user_id", 1), ("company_slug", 1), ("batch_key", 1)])
+            logger.info("✓ Índices do MongoDB secundário criados com sucesso")
+        except Exception as exc:
+            logger.error("✗ Erro ao criar índices do MongoDB secundário: %s", exc)
+
 
 def get_db():
     """Retorna instância ativa do MongoDB."""
     return MongoDB.db
+
+
+def get_secondary_db():
+    """Retorna instância ativa do MongoDB secundário para dados demo."""
+    if MongoDB.secondary_db is None:
+        raise RuntimeError(
+            "Secondary MongoDB is not configured. Configure SECONDARY_MONGODB_URI and SECONDARY_DATABASE_NAME."
+        )
+    return MongoDB.secondary_db
 
 
 async def connect_db() -> None:
@@ -110,6 +142,32 @@ async def connect_db() -> None:
 
         logger.info("Conectado ao MongoDB com sucesso")
         await MongoDB.create_indexes()
+
+        secondary_uri = str(settings.secondary_mongodb_uri or "").strip()
+        secondary_db_name = str(settings.secondary_database_name or "").strip()
+        if secondary_uri and secondary_db_name:
+            try:
+                MongoDB.secondary_client = MongoClient(
+                    secondary_uri,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=10000,
+                    retryWrites=True,
+                    w="majority",
+                )
+                MongoDB.secondary_client.admin.command("ping")
+                MongoDB.secondary_db = MongoDB.secondary_client[secondary_db_name]
+                logger.info("Conectado ao MongoDB secundário com sucesso")
+                await MongoDB.create_secondary_indexes()
+            except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as secondary_exc:
+                logger.warning("MongoDB secundário indisponível: %s", secondary_exc)
+                MongoDB.secondary_db = None
+                if MongoDB.secondary_client:
+                    MongoDB.secondary_client.close()
+                    MongoDB.secondary_client = None
+        elif secondary_uri or secondary_db_name:
+            logger.warning(
+                "MongoDB secundário parcialmente configurado. Defina SECONDARY_MONGODB_URI e SECONDARY_DATABASE_NAME."
+            )
     except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as exc:
         logger.exception("MongoDB connection failed")
         raise RuntimeError(f"MongoDB connection failed: {exc}") from exc
@@ -122,3 +180,9 @@ async def disconnect_db() -> None:
         MongoDB.client = None
         MongoDB.db = None
         logger.info("Conexao com MongoDB fechada")
+
+    if MongoDB.secondary_client:
+        MongoDB.secondary_client.close()
+        MongoDB.secondary_client = None
+        MongoDB.secondary_db = None
+        logger.info("Conexao com MongoDB secundário fechada")

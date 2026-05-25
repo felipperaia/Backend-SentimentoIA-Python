@@ -7,6 +7,7 @@ from pymongo import ReturnDocument
 
 from app.config import settings
 from app.database import get_db
+from app.services.company_utils import normalize_company_filter, slugify_company
 from app.services.enrichment_service import EnrichmentService
 from app.services.llm_service import LLMService
 from app.services.normalization_service import utcnow
@@ -428,6 +429,12 @@ class InsightService:
                 or "indefinida"
             )
 
+        company_name = str(brand_name or "indefinida")
+        company_slug = normalize_company_filter(
+            company_slug=(search_job or {}).get("company_slug") if context_type == "search" else batch.get("company_slug") if context_type == "batch" else None,
+            company_id=company_name,
+        ) or slugify_company(company_name)
+
         if not mentions:
             raise ValueError("Contexto sem mencoes processadas")
 
@@ -471,12 +478,16 @@ class InsightService:
 
         published = [m.get("published_at") for m in mentions if isinstance(m.get("published_at"), datetime)]
         if published:
+            period_from = min(published)
+            period_to = max(published)
             date_range = {
-                "start": min(published).isoformat(),
-                "end": max(published).isoformat(),
+                "start": period_from.isoformat(),
+                "end": period_to.isoformat(),
             }
-            period = f"{min(published).date().isoformat()}/{max(published).date().isoformat()}"
+            period = f"{period_from.date().isoformat()}/{period_to.date().isoformat()}"
         else:
+            period_from = None
+            period_to = None
             date_range = {"start": None, "end": None}
             period = "indefinido"
 
@@ -511,8 +522,12 @@ class InsightService:
             "context_id": context_id,
             "context_type": context_type,
             "brand": brand_name,
+            "company_name": company_name,
+            "company_slug": company_slug,
             "query": brand_name,
             "period": period,
+            "period_from": period_from,
+            "period_to": period_to,
             "date_range": date_range,
             "total_mentions": len(mentions),
             "total_comments": len(mentions),
@@ -539,8 +554,12 @@ class InsightService:
             "context_id": context_id,
             "context_type": context_type,
             "brand": "indefinida",
+            "company_name": "indefinida",
+            "company_slug": None,
             "query": "indefinida",
             "period": "indefinido",
+            "period_from": None,
+            "period_to": None,
             "date_range": {"start": None, "end": None},
             "total_mentions": 0,
             "total_comments": 0,
@@ -661,8 +680,18 @@ class InsightService:
             action_list = analysis.get("recommended_actions") or []
             recommended_action = str(action_list[0]) if action_list else "Priorizar tratativas de alta severidade."
 
+        company_name = str(snapshot.get("company_name") or snapshot.get("brand") or "indefinida")
+        company_slug = normalize_company_filter(
+            company_slug=str(snapshot.get("company_slug") or "") or None,
+            company_id=company_name,
+        )
+
         return {
             "company": str(snapshot.get("brand") or "indefinida"),
+            "company_name": company_name,
+            "company_slug": company_slug,
+            "period_from": snapshot.get("period_from"),
+            "period_to": snapshot.get("period_to"),
             "priority": final_priority,
             "urgency": final_urgency,
             "root_cause": root_cause,
@@ -816,6 +845,9 @@ class InsightService:
         include_archived: bool = False,
         limit: int = 50,
         batch_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
         priority: str | None = None,
         resolution: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -823,19 +855,67 @@ class InsightService:
         if db is None:
             raise RuntimeError(DB_UNAVAILABLE_ERROR)
 
-        query: dict[str, Any] = {"user_id": user_id}
+        conditions: list[dict[str, Any]] = [{"user_id": user_id}]
         if not include_archived:
-            query["archived"] = False
+            conditions.append({"archived": False})
+
         if batch_id:
-            query["$or"] = [
-                {"batch_id": batch_id},
-                {"search_id": batch_id},
-                {"context_id": batch_id},
-            ]
+            conditions.append(
+                {
+                    "$or": [
+                        {"batch_id": batch_id},
+                        {"search_id": batch_id},
+                        {"context_id": batch_id},
+                    ]
+                }
+            )
+
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_slug)
+        if normalized_company_slug:
+            conditions.append(
+                {
+                    "$or": [
+                        {"company_slug": normalized_company_slug},
+                        {"snapshot.company_slug": normalized_company_slug},
+                    ]
+                }
+            )
+
+        if period_from:
+            conditions.append(
+                {
+                    "$or": [
+                        {"period_to": {"$gte": period_from}},
+                        {
+                            "$and": [
+                                {"period_to": {"$exists": False}},
+                                {"created_at": {"$gte": period_from}},
+                            ]
+                        },
+                    ]
+                }
+            )
+        if period_to:
+            conditions.append(
+                {
+                    "$or": [
+                        {"period_from": {"$lte": period_to}},
+                        {
+                            "$and": [
+                                {"period_from": {"$exists": False}},
+                                {"created_at": {"$lte": period_to}},
+                            ]
+                        },
+                    ]
+                }
+            )
+
         if priority:
-            query["priority"] = InsightService._normalize_priority(priority, fallback="medium")
+            conditions.append({"priority": InsightService._normalize_priority(priority, fallback="medium")})
         if resolution:
-            query["resolution"] = InsightService._normalize_resolution(resolution, fallback="pending")
+            conditions.append({"resolution": InsightService._normalize_resolution(resolution, fallback="pending")})
+
+        query: dict[str, Any] = {"$and": conditions}
 
         items = list(
             db.insights.find(query).sort("created_at", -1).limit(max(1, min(limit, 200)))
