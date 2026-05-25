@@ -5,6 +5,7 @@ import asyncio
 from typing import Any
 
 import httpx
+from fastapi import HTTPException
 
 from app.config import settings
 from app.services.urgency_engine import urgency_engine
@@ -583,13 +584,14 @@ class LLMService:
         fail_on_unavailable: bool = False,
         **legacy_kwargs: Any,
     ) -> str:
-        fallback = "Desculpe, o assistente esta temporariamente indisponivel."
+        del fail_on_unavailable
 
         if not LLMService.ollama_configured():
             logger.warning("Chat LLM indisponivel por configuracao ausente")
-            if fail_on_unavailable:
-                raise RuntimeError("LLM nao configurada")
-            return fallback
+            raise HTTPException(
+                status_code=503,
+                detail="LLM temporariamente indisponível. Tente novamente em instantes.",
+            )
 
         try:
             if legacy_kwargs:
@@ -615,9 +617,10 @@ class LLMService:
                 )
                 if response:
                     return response
-                if fail_on_unavailable:
-                    raise RuntimeError("Resposta vazia da LLM")
-                return fallback
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM temporariamente indisponível. Tente novamente em instantes.",
+                )
 
             safe_context = LLMService.sanitize_context(authorized_context or {})
             safe_messages: list[dict[str, str]] = []
@@ -645,9 +648,10 @@ class LLMService:
                 safe_messages.append({"role": role, "content": content[:6000]})
 
             if not safe_messages:
-                if fail_on_unavailable:
-                    raise RuntimeError("Payload de chat invalido")
-                return fallback
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM temporariamente indisponível. Tente novamente em instantes.",
+                )
 
             prompt_parts = [f"{item.get('role', 'user').upper()}:\n{item.get('content', '')}" for item in safe_messages]
             rendered_prompt = "\n\n".join(prompt_parts)
@@ -656,16 +660,20 @@ class LLMService:
                 model=LLMService._model(),
             )
             if not response:
-                logger.warning("Chat LLM retornou vazio; fallback aplicado")
-                if fail_on_unavailable:
-                    raise RuntimeError("Resposta vazia da LLM")
-                return fallback
+                logger.warning("Chat LLM retornou vazio")
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM temporariamente indisponível. Tente novamente em instantes.",
+                )
             return response
         except Exception as exc:
-            logger.warning("Falha no chat Ollama; fallback aplicado: %s", exc)
-            if fail_on_unavailable:
-                raise RuntimeError("Falha de conectividade com a LLM") from exc
-            return fallback
+            logger.warning("Falha no chat Ollama: %s", exc)
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(
+                status_code=503,
+                detail="LLM temporariamente indisponível. Tente novamente em instantes.",
+            ) from exc
 
     @staticmethod
     async def health_check() -> dict[str, Any]:

@@ -4,6 +4,8 @@ from typing import Any
 from uuid import uuid4
 import re
 
+from fastapi import HTTPException
+
 from app.database import get_db
 from app.services.controlled_context_service import build_authorized_context
 from app.services.llm_service import LLMService
@@ -242,7 +244,7 @@ class ChatService:
                 authorized_context=authorized_context,
                 fail_on_unavailable=True,
             )
-        except RuntimeError as exc:
+        except Exception as exc:
             db.chat_threads.update_one(
                 {"_id": thread_id, "user_id": user_id},
                 {
@@ -253,8 +255,11 @@ class ChatService:
                     }
                 },
             )
+            detail = "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
+            if isinstance(exc, HTTPException):
+                detail = str(exc.detail or detail)
             raise ChatUnavailableError(
-                "Assistente IA indisponivel no momento. Verifique a conectividade com o Ollama e tente novamente."
+                detail
             ) from exc
 
         if not isinstance(assistant_content, str) or not assistant_content.strip():

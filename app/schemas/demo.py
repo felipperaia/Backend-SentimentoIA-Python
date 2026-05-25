@@ -29,6 +29,7 @@ class SeedBatch(BaseModel):
     period_from: datetime
     period_to: datetime
     dashboard_metrics: SeedDashboardMetrics
+    mentions: list[dict[str, Any]] = Field(default_factory=list)
     insights: list[SeedInsight] = Field(default_factory=list)
 
 

@@ -268,9 +268,13 @@ async def change_password(payload: ChangePasswordRequest, current_user: CurrentU
 
 
 @router.post("/logout")
-async def logout():
-    """JWT é stateless; logout é feito no frontend removendo o token."""
-    return {"status": "success"}
+async def logout(current_user: CurrentUser):
+    """JWT é stateless; frontend remove token e preferencias locais apos logout."""
+    del current_user
+    return {
+        "status": "logged_out",
+        "clear_preferences": True,
+    }
 
 
 @router.get("/mfa/status", response_model=MFAStatusResponse)

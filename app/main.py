@@ -24,7 +24,7 @@ from app.api.mentions_router import router as mentions_router
 from app.api.reports_router import router as reports_router
 from app.auth_utils import decode_access_token, get_current_user, get_optional_current_user
 from app.config import settings
-from app.database import connect_db, disconnect_db, get_db
+from app.database import connect_db, disconnect_db, get_db, get_secondary_db
 from app.models import ScrapeRequest, SearchRequest
 from app.schemas import (
     ChatMessageCreateRequest,
@@ -609,31 +609,54 @@ async def dashboard(
     search_id: str | None = Query(None),
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
-    mode: str = Query("live"),
+    mode: str = Query("demo"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
     period_days: int | None = Query(None, ge=1, le=365),
     limit_mentions: int = Query(200, ge=1, le=1000),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Retorna dashboard do pipeline processado (mentions status=processed)."""
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    selected_batch_id = batch_id or search_id
-    selected_company_slug = company_slug or company_id
-    normalized_mode = str(mode or "live").strip().lower()
-    if normalized_mode not in {"live", "demo"}:
-        raise HTTPException(status_code=400, detail="Modo invalido. Use live ou demo")
+    """Retorna dashboard com snapshots demo do MongoDB secundario."""
+    del batch_id, search_id, mode, period_days, limit_mentions
 
-    return DashboardService.get_dashboard(
-        user_id=user_id,
-        batch_id=selected_batch_id,
-        period_days=period_days,
-        limit_mentions=limit_mentions,
-        mode=normalized_mode,
-        company_slug=selected_company_slug,
-        period_from=period_from,
-        period_to=period_to,
-    )
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        secondary_db = get_secondary_db()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Secondary MongoDB not configured") from exc
+
+    collection = secondary_db.demo_dashboard_snapshots
+    query: dict[str, Any] = {"user_id": user_id}
+
+    normalized_slug = str(company_slug or company_id or "").strip().lower()
+    if normalized_slug:
+        query["company_slug"] = normalized_slug
+
+    overlap_conditions: list[dict[str, Any]] = []
+    if period_from:
+        overlap_conditions.append({"period_to": {"$gte": period_from}})
+    if period_to:
+        overlap_conditions.append({"period_from": {"$lte": period_to}})
+    if overlap_conditions:
+        query["$and"] = overlap_conditions
+
+    snapshots = list(collection.find(query).sort("period_from", -1))
+    if not snapshots:
+        return {"data": [], "message": "Nenhum dado encontrado para esta empresa."}
+
+    latest = snapshots[0]
+    period_from_value = latest.get("period_from")
+    period_to_value = latest.get("period_to")
+    period_label = f"{period_from_value or ''} - {period_to_value or ''}"
+
+    return {
+        "current_company_name": latest.get("company_name"),
+        "current_company_slug": latest.get("company_slug"),
+        "period_label": period_label,
+        "metrics": latest.get("metrics", {}),
+        "mentions": latest.get("mentions", []),
+        "insights": latest.get("insights", []),
+    }
 
 
 @app.get("/api/mentions")
