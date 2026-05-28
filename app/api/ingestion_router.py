@@ -11,12 +11,61 @@ router = APIRouter()
 
 @router.post("/comments", response_model=IngestionBatchResponse, status_code=status.HTTP_202_ACCEPTED)
 async def ingest_comments(
-    payload: list[dict[str, Any]] = Body(...),
+    payload: Any = Body(...),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     user_id = str(current_user.get("_id") or current_user.get("id"))
+    normalized_payload: list[dict[str, Any]]
+    if isinstance(payload, list):
+        normalized_payload = payload
+    elif isinstance(payload, dict):
+        mentions = payload.get("mentions")
+        comments = payload.get("comments")
+        if isinstance(mentions, list):
+            normalized_payload = mentions
+        elif isinstance(comments, list):
+            normalized_payload = comments
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "payload de ingestao invalido",
+                    "items": [
+                        {
+                            "index": 0,
+                            "errors": [
+                                {
+                                    "type": "value_error",
+                                    "loc": ["body"],
+                                    "msg": "envie um array JSON ou objeto com campo mentions/comments em array",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "payload de ingestao invalido",
+                "items": [
+                    {
+                        "index": 0,
+                        "errors": [
+                            {
+                                "type": "type_error",
+                                "loc": ["body"],
+                                "msg": "body deve ser array JSON ou objeto",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
     try:
-        return IngestionService.ingest_comments(user_id=user_id, payload=payload)
+        return IngestionService.ingest_comments(user_id=user_id, payload=normalized_payload)
     except IngestionValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
