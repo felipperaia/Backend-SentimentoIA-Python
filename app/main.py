@@ -653,8 +653,37 @@ async def search_mentions(
     if imported_mentions:
         db.mentions.insert_many(imported_mentions)
 
+    primary_query: dict[str, Any] = {
+        "user_id": user_id,
+        "company_slug": company_slug,
+    }
+    if requested_sources:
+        primary_query["source"] = {"$in": requested_sources}
+    if published_filter:
+        primary_query["published_at"] = dict(published_filter)
+
     total_imported = len(imported_mentions)
-    metrics = EnrichmentService.aggregate(imported_mentions) if imported_mentions else EnrichmentService.aggregate([])
+    total_available = int(db.mentions.count_documents(primary_query))
+    result_mentions = list(
+        db.mentions.find(primary_query, {"raw": 0, "raw_payload": 0}).sort("published_at", -1).limit(int(payload.limit))
+    )
+    metrics = EnrichmentService.aggregate(result_mentions) if result_mentions else EnrichmentService.aggregate([])
+    status = "completed" if total_available > 0 else "empty"
+    status_summary = {
+        "status": "success" if total_available > 0 else "empty",
+        "partial_success": False,
+        "message": (
+            f"Importacao concluida. {total_imported} mencao(oes) novas inseridas e {duplicate_count} duplicada(s) ignorada(s)."
+            if total_available > 0
+            else "Nenhuma mencao encontrada para os filtros informados."
+        ),
+        "sources_requested": len(requested_sources),
+        "sources_with_data": len({str(item.get('source') or '').strip().lower() for item in result_mentions if item.get('source')}),
+        "sources_failed": 0,
+        "timeout_sources": [],
+        "source_status": [],
+        "unmapped_error_count": 0,
+    }
 
     filtros_aplicados = {
         "user_id": user_id,
@@ -674,8 +703,8 @@ async def search_mentions(
                 "query": company_name,
                 "company_name": company_name,
                 "company_slug": company_slug,
-                "status": "completed" if total_imported > 0 else "empty",
-                "total": total_imported,
+                "status": status,
+                "total": total_available,
                 "duplicate_count": duplicate_count,
                 "sources": requested_sources,
                 "period_days": int(payload.period_days or 0),
@@ -683,6 +712,7 @@ async def search_mentions(
                 "period_to": effective_period_to,
                 "metrics": metrics,
                 "errors": [],
+                "status_summary": status_summary,
                 "staging_filters": filtros_aplicados,
                 "updated_at": now,
             },
@@ -695,6 +725,16 @@ async def search_mentions(
 
     return {
         "search_id": search_id,
+        "query": company_name,
+        "status": status_summary["status"],
+        "partial_success": False,
+        "status_summary": status_summary,
+        "total": total_available,
+        "mentions": SearchService.serialize_many(result_mentions),
+        "metrics": metrics,
+        "llm_analysis": {},
+        "alerts": [],
+        "errors": [],
         "company_slug": company_slug,
         "total_importado": total_imported,
         "duplicados": duplicate_count,

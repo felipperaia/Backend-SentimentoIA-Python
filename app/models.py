@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, model_validator
 from enum import Enum
 
 
@@ -328,8 +328,8 @@ class SearchRequest(BaseModel):
     sources: List[str] = Field(default_factory=list)
     limit: int = Field(default=200, ge=1, le=2000)
     period_days: Optional[int] = Field(default=30, ge=1, le=3650)
-    period_from: Optional[datetime] = None
-    period_to: Optional[datetime] = None
+    period_from: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("period_from", "from"))
+    period_to: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("period_to", "to"))
 
     @model_validator(mode="after")
     def normalize_query_alias(self) -> "SearchRequest":
