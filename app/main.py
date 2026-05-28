@@ -514,15 +514,28 @@ async def privacy_export_summary(current_user: dict[str, Any] = Depends(get_curr
 async def integrations_status():
     """Mostra estado das integrações centrais (ingestão JSON + LLM)."""
     llm = await LLMService.healthcheck()
+    primary_uri = str(settings.mongodb_uri or "").strip()
+    primary_db_name = str(settings.database_name or "").strip()
+    secondary_uri = str(settings.secondary_mongodb_uri or "").strip()
+    secondary_db_name = str(settings.secondary_database_name or "").strip()
     secondary_configured = bool(
-        str(settings.secondary_mongodb_uri or "").strip()
-        and str(settings.secondary_database_name or "").strip()
+        secondary_uri
+        and secondary_db_name
+    )
+    secondary_same_as_primary = bool(
+        secondary_uri
+        and primary_uri
+        and secondary_uri == primary_uri
+        and secondary_db_name == primary_db_name
     )
     return {
         "ingestion_json_enabled": True,
         "ingestion_staging_collection": IngestionService.STAGING_COLLECTION,
-        "mongodb_primary_configured": bool(settings.mongodb_uri),
+        "mongodb_primary_configured": bool(primary_uri),
         "mongodb_secondary_configured": secondary_configured,
+        "mongodb_primary_database_name": primary_db_name or None,
+        "mongodb_secondary_database_name": secondary_db_name or None,
+        "mongodb_secondary_same_as_primary": secondary_same_as_primary,
         "llm": llm,
     }
 

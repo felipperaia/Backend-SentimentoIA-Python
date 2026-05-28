@@ -140,6 +140,20 @@ async def connect_db() -> None:
         secondary_uri = str(settings.secondary_mongodb_uri or "").strip()
         secondary_db_name = str(settings.secondary_database_name or "").strip()
         if secondary_uri and secondary_db_name:
+            same_uri = secondary_uri == mongodb_uri
+            same_db_name = secondary_db_name == str(settings.database_name or "").strip()
+            if same_uri and same_db_name:
+                error = (
+                    "Configuracao invalida: banco secundario aponta para o mesmo URI e DATABASE_NAME do banco primario. "
+                    "Use SECONDARY_MONGODB_URI/SECONDARY_DATABASE_NAME distintos."
+                )
+                logger.error(error)
+                raise RuntimeError(error)
+            if same_uri and not same_db_name:
+                logger.warning(
+                    "MongoDB secundario usa o mesmo cluster do primario, mas com database diferente: %s",
+                    secondary_db_name,
+                )
             try:
                 MongoDB.secondary_client = MongoClient(
                     secondary_uri,
