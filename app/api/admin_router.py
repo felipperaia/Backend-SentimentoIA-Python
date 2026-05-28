@@ -1,47 +1,46 @@
 import logging
-from fastapi import APIRouter, HTTPException, status, Query, Depends
-from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Any
+
 from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from app.auth_utils import get_current_user
 from app.database import get_db
 from app.schemas import UserRole
+from app.services import AuthService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-def verify_admin(user_id: str):
-    """Verifica se o usuário é administrador"""
-    db = get_db()
-    user = db.users.find_one({"_id": ObjectId(user_id)})
-    
-    if not user or user.get("role") != UserRole.ADMIN.value:
+
+def verify_admin(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    role = str(current_user.get("role") or "").strip().lower()
+    if role != UserRole.ADMIN.value:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso negado. Privilégios de administrador necessários"
+            detail="Acesso negado. Privilegios de administrador necessarios",
         )
-    
-    return user
+    return current_user
 
-@router.get("/users", dependencies=[Depends(verify_admin)])
+
+@router.get("/users")
 async def list_users(
-    user_id: str,
     limit: int = Query(10, ge=1, le=100),
     skip: int = Query(0, ge=0),
+    current_admin: dict[str, Any] = Depends(verify_admin),
 ):
-    """Lista todos os usuários (admin only)"""
+    del current_admin
     try:
         db = get_db()
-        
         users = list(
             db.users.find({}, {"password_hash": 0, "mfa_secret": 0})
             .sort("created_at", -1)
             .skip(skip)
             .limit(limit)
         )
-        
         total = db.users.count_documents({})
-        
         return {
             "total": total,
             "limit": limit,
@@ -59,40 +58,34 @@ async def list_users(
                     "last_signed_in": u.get("last_signed_in"),
                 }
                 for u in users
-            ]
+            ],
         }
-    
-    except Exception as e:
-        logger.error(f"✗ Erro ao listar usuários: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao listar usuários"
-        )
+    except Exception as exc:
+        logger.error("Erro ao listar usuarios: %s", exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro ao listar usuarios") from exc
 
-@router.get("/audit-logs", dependencies=[Depends(verify_admin)])
+
+@router.get("/audit-logs")
 async def get_audit_logs(
-    user_id: str,
-    action: Optional[str] = Query(None),
+    action: str | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
     skip: int = Query(0, ge=0),
+    current_admin: dict[str, Any] = Depends(verify_admin),
 ):
-    """Obtém logs de auditoria (admin only)"""
+    del current_admin
     try:
         db = get_db()
-        
-        filter_query = {}
+        filter_query: dict[str, Any] = {}
         if action:
             filter_query["action"] = action
-        
+
         logs = list(
             db.audit_logs.find(filter_query)
             .sort("timestamp", -1)
             .skip(skip)
             .limit(limit)
         )
-        
         total = db.audit_logs.count_documents(filter_query)
-        
         return {
             "total": total,
             "limit": limit,
@@ -107,37 +100,34 @@ async def get_audit_logs(
                     "timestamp": l.get("timestamp"),
                 }
                 for l in logs
-            ]
+            ],
         }
-    
-    except Exception as e:
-        logger.error(f"✗ Erro ao obter logs de auditoria: {e}")
+    except Exception as exc:
+        logger.error("Erro ao obter logs de auditoria: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao obter logs de auditoria"
-        )
+            detail="Erro ao obter logs de auditoria",
+        ) from exc
 
-@router.get("/system-stats", dependencies=[Depends(verify_admin)])
-async def get_system_stats(user_id: str):
-    """Obtém estatísticas do sistema (admin only)"""
+
+@router.get("/system-stats")
+async def get_system_stats(current_admin: dict[str, Any] = Depends(verify_admin)):
+    del current_admin
     try:
         db = get_db()
-        
+
         total_users = db.users.count_documents({})
         total_brands = db.brands.count_documents({})
         total_mentions = db.mentions.count_documents({})
         total_analyses = db.sentiment_analysis.count_documents({})
         total_reports = db.reports.count_documents({})
-        
-        # Menções dos últimos 7 dias
-        from datetime import timedelta
+
         seven_days_ago = datetime.utcnow() - timedelta(days=7)
         recent_mentions = db.mentions.count_documents({"created_at": {"$gte": seven_days_ago}})
-        
-        # Taxa de sucesso de relatórios
+
         total_reports_completed = db.reports.count_documents({"status": "completed"})
         report_success_rate = (total_reports_completed / total_reports * 100) if total_reports > 0 else 0
-        
+
         return {
             "total_users": total_users,
             "total_brands": total_brands,
@@ -148,78 +138,69 @@ async def get_system_stats(user_id: str):
             "report_success_rate": round(report_success_rate, 2),
             "timestamp": datetime.utcnow(),
         }
-    
-    except Exception as e:
-        logger.error(f"✗ Erro ao obter estatísticas do sistema: {e}")
+    except Exception as exc:
+        logger.error("Erro ao obter estatisticas do sistema: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao obter estatísticas do sistema"
-        )
+            detail="Erro ao obter estatisticas do sistema",
+        ) from exc
 
-@router.post("/users/{target_user_id}/toggle-active", dependencies=[Depends(verify_admin)])
-async def toggle_user_active(user_id: str, target_user_id: str):
-    """Ativa ou desativa um usuário (admin only)"""
+
+@router.post("/users/{target_user_id}/toggle-active")
+async def toggle_user_active(
+    target_user_id: str,
+    current_admin: dict[str, Any] = Depends(verify_admin),
+):
     try:
         db = get_db()
-        
         user = db.users.find_one({"_id": ObjectId(target_user_id)})
-        
+
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Usuário não encontrado"
-            )
-        
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario nao encontrado")
+
         new_status = not user.get("is_active", True)
-        
         db.users.update_one(
             {"_id": ObjectId(target_user_id)},
-            {"$set": {"is_active": new_status}}
-        )
-        
-        # Log de auditoria
-        from app.services import AuthService
-        AuthService.log_audit(
-            user_id=user_id,
-            action="user_status_changed",
-            details={"target_user_id": target_user_id, "new_status": new_status}
-        )
-        
-        return {
-            "status": "success",
-            "user_id": target_user_id,
-            "is_active": new_status
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"✗ Erro ao alterar status do usuário: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao alterar status do usuário"
+            {"$set": {"is_active": new_status}},
         )
 
-@router.get("/alerts", dependencies=[Depends(verify_admin)])
+        admin_user_id = str(current_admin.get("_id") or current_admin.get("id") or "")
+        AuthService.log_audit(
+            user_id=admin_user_id,
+            action="user_status_changed",
+            details={"target_user_id": target_user_id, "new_status": new_status},
+        )
+
+        return {"status": "success", "user_id": target_user_id, "is_active": new_status}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Erro ao alterar status do usuario: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erro ao alterar status do usuario",
+        ) from exc
+
+
+@router.get("/alerts")
 async def get_system_alerts(
-    user_id: str,
-    severity: Optional[str] = Query(None),
+    severity: str | None = Query(None),
     limit: int = Query(20, ge=1, le=100),
+    current_admin: dict[str, Any] = Depends(verify_admin),
 ):
-    """Obtém alertas do sistema (admin only)"""
+    del current_admin
     try:
         db = get_db()
-        
-        filter_query = {}
+        filter_query: dict[str, Any] = {}
         if severity:
             filter_query["severity"] = severity
-        
+
         alerts = list(
             db.alerts.find(filter_query)
             .sort("created_at", -1)
             .limit(limit)
         )
-        
+
         return {
             "total": len(alerts),
             "alerts": [
@@ -232,12 +213,8 @@ async def get_system_alerts(
                     "resolved": a.get("resolved", False),
                 }
                 for a in alerts
-            ]
+            ],
         }
-    
-    except Exception as e:
-        logger.error(f"✗ Erro ao obter alertas: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erro ao obter alertas"
-        )
+    except Exception as exc:
+        logger.error("Erro ao obter alertas: %s", exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro ao obter alertas") from exc

@@ -69,14 +69,6 @@ from .settings import (
     UserSettingsUpdateRequest,
 )
 
-from .demo import (
-    SeedInsight,
-    SeedDashboardMetrics,
-    SeedBatch,
-    SeedCompany,
-    DemoSeedPayload,
-)
-
 from .privacy import (
     PrivacyConsentPreferences,
     PrivacyConsentUpsertRequest,
@@ -143,12 +135,6 @@ __all__ = [
     # Settings schemas
     "UserSettingsResponse",
     "UserSettingsUpdateRequest",
-    # Demo schemas
-    "SeedInsight",
-    "SeedDashboardMetrics",
-    "SeedBatch",
-    "SeedCompany",
-    "DemoSeedPayload",
     # Privacy schemas
     "PrivacyConsentPreferences",
     "PrivacyConsentUpsertRequest",

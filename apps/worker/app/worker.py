@@ -11,10 +11,8 @@ if str(ROOT_DIR) not in sys.path:
 
 from app.config import settings
 from app.database import MongoDB, get_db
-from app.services.collector_orchestrator import CollectorOrchestrator
 from app.services.insight_service import InsightService
 from app.services.processing_service import ProcessingService
-from app.services.source_registry_service import SourceRegistryService
 
 
 logging.basicConfig(level=settings.log_level)
@@ -39,25 +37,11 @@ async def run_worker() -> None:
         while _is_running:
             try:
                 db = get_db()
-                if db is not None:
-                    latest_search = db.search_jobs.find_one(
-                        {"status": {"$in": ["running", "completed"]}},
-                        sort=[("updated_at", -1)],
-                    )
-                    latest_query = str((latest_search or {}).get("query") or "").strip()
-                    latest_sources = (latest_search or {}).get("sources")
+                if db is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
 
-                    if latest_query:
-                        orchestrator_sources = latest_sources if isinstance(latest_sources, list) else SourceRegistryService.default_sources()
-                        orchestrator = CollectorOrchestrator(active_sources=orchestrator_sources)
-                        await orchestrator.gather_all(
-                            query=latest_query,
-                            limit=min(batch_size, int(settings.SCRAPER_MAX_ITEMS_PER_SOURCE)),
-                        )
-                        if orchestrator.last_errors:
-                            logger.warning("Orchestrator de coleta reportou %s falhas no ciclo atual", len(orchestrator.last_errors))
-
-                cycle_result = ProcessingService.process_pending_mentions(limit=batch_size)
+                cycle_result = await ProcessingService.process_pending_mentions(limit=batch_size)
                 queue_result = InsightService.enqueue_jobs_for_ready_batches(limit=100)
                 insight_result = await InsightService.process_queued_jobs(limit=2)
 

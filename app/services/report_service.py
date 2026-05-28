@@ -1,7 +1,6 @@
 import csv
-import hashlib
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 from typing import Any
 
@@ -9,11 +8,28 @@ from fastapi.responses import Response, StreamingResponse
 
 from app.database import get_db
 from app.services.company_utils import normalize_company_filter, slugify_company
+from app.services.dashboard_service import DashboardService
 from app.services.search_service import SearchService
 
 
 class ReportService:
     """Exportação real CSV/PDF baseada no MongoDB, compatível com search_id e batch_id."""
+
+    @staticmethod
+    def _effective_period_range(
+        *,
+        period_from: datetime | None,
+        period_to: datetime | None,
+        period_days: int | None,
+    ) -> tuple[datetime | None, datetime | None]:
+        if isinstance(period_from, datetime) or isinstance(period_to, datetime):
+            return period_from, period_to
+
+        if period_days and int(period_days) > 0:
+            now = datetime.now(timezone.utc)
+            return now - timedelta(days=int(period_days)), now
+
+        return None, None
 
     @staticmethod
     def _sort_timestamp(value: Any) -> float:
@@ -289,54 +305,20 @@ class ReportService:
         normalized_resolution = ReportService._normalize_resolution_filter(resolution)
         normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_slug)
 
+        if not normalized_company_slug:
+            return []
+
         if normalized_priority:
             conditions.append({"priority": normalized_priority})
         if normalized_resolution:
             conditions.append({"resolution": normalized_resolution})
 
-        if normalized_company_slug:
-            company_regex = ReportService._company_regex_from_slug(normalized_company_slug)
-            conditions.append(
-                {
-                    "$or": [
-                        {"company_slug": normalized_company_slug},
-                        {"snapshot.company_slug": normalized_company_slug},
-                        {"company": {"$regex": company_regex, "$options": "i"}},
-                        {"company_name": {"$regex": company_regex, "$options": "i"}},
-                        {"snapshot.brand": {"$regex": company_regex, "$options": "i"}},
-                        {"snapshot.company_name": {"$regex": company_regex, "$options": "i"}},
-                    ]
-                }
-            )
+        conditions.append({"company_slug": normalized_company_slug})
 
         if period_from:
-            conditions.append(
-                {
-                    "$or": [
-                        {"period_to": {"$gte": period_from}},
-                        {
-                            "$and": [
-                                {"period_to": {"$exists": False}},
-                                {"created_at": {"$gte": period_from}},
-                            ]
-                        },
-                    ]
-                }
-            )
+            conditions.append({"period_to": {"$gte": period_from}})
         if period_to:
-            conditions.append(
-                {
-                    "$or": [
-                        {"period_from": {"$lte": period_to}},
-                        {
-                            "$and": [
-                                {"period_from": {"$exists": False}},
-                                {"created_at": {"$lte": period_to}},
-                            ]
-                        },
-                    ]
-                }
-            )
+            conditions.append({"period_from": {"$lte": period_to}})
 
         query: dict[str, Any] = {"$and": conditions}
 
@@ -695,65 +677,122 @@ class ReportService:
         if db is None:
             raise RuntimeError("Banco de dados indisponivel")
 
-        jobs = ReportService._resolve_search_jobs(
-            db=db,
-            user_id=user_id,
-            company_id=company_id,
-            company_slug=company_slug,
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_id)
+        if not normalized_company_slug:
+            return {
+                "total": 0,
+                "limit": max(1, min(int(limit), 200)),
+                "offset": max(0, int(offset)),
+                "items": [],
+            }
+
+        effective_period_from, effective_period_to = ReportService._effective_period_range(
             period_from=period_from,
             period_to=period_to,
+            period_days=None,
         )
+        if (
+            isinstance(effective_period_from, datetime)
+            and isinstance(effective_period_to, datetime)
+            and effective_period_from > effective_period_to
+        ):
+            return {
+                "total": 0,
+                "limit": max(1, min(int(limit), 200)),
+                "offset": max(0, int(offset)),
+                "items": [],
+            }
+
+        query: dict[str, Any] = {
+            "user_id": user_id,
+            "company_slug": normalized_company_slug,
+        }
+        published_filter: dict[str, Any] = {}
+        if isinstance(effective_period_from, datetime):
+            published_filter["$gte"] = effective_period_from
+        if isinstance(effective_period_to, datetime):
+            published_filter["$lte"] = effective_period_to
+        if published_filter:
+            query["published_at"] = published_filter
+
+        mentions = list(
+            db.mentions.find(
+                query,
+                {"company_name": 1, "query": 1, "published_at": 1, "created_at": 1},
+            )
+            .sort("published_at", -1)
+            .limit(1000)
+        )
+
+        if not mentions:
+            return {
+                "total": 0,
+                "limit": max(1, min(int(limit), 200)),
+                "offset": max(0, int(offset)),
+                "items": [],
+            }
+
+        company_name = str(
+            mentions[0].get("company_name")
+            or mentions[0].get("query")
+            or normalized_company_slug
+        )
+
+        values = [
+            item.get("published_at") or item.get("created_at")
+            for item in mentions
+            if isinstance(item.get("published_at") or item.get("created_at"), datetime)
+        ]
+        period_start = min(values).isoformat() if values else None
+        period_end = max(values).isoformat() if values else None
+
+        all_items = [
+            {
+                "report_id": f"report_{normalized_company_slug}_mentions_csv",
+                "company_name": company_name,
+                "company_slug": normalized_company_slug,
+                "period_from": period_start,
+                "period_to": period_end,
+                "report_type": "mentions_csv",
+                "export_key": "mentions_csv",
+            },
+            {
+                "report_id": f"report_{normalized_company_slug}_dashboard_pdf",
+                "company_name": company_name,
+                "company_slug": normalized_company_slug,
+                "period_from": period_start,
+                "period_to": period_end,
+                "report_type": "dashboard_pdf",
+                "export_key": "dashboard_pdf",
+            },
+            {
+                "report_id": f"report_{normalized_company_slug}_insights_pdf",
+                "company_name": company_name,
+                "company_slug": normalized_company_slug,
+                "period_from": period_start,
+                "period_to": period_end,
+                "report_type": "insights_pdf",
+                "export_key": "insights_pdf",
+            },
+            {
+                "report_id": f"report_{normalized_company_slug}_metrics_pdf",
+                "company_name": company_name,
+                "company_slug": normalized_company_slug,
+                "period_from": period_start,
+                "period_to": period_end,
+                "report_type": "metrics_pdf",
+                "export_key": "metrics_pdf",
+            },
+        ]
 
         safe_limit = max(1, min(int(limit), 200))
         safe_offset = max(0, int(offset))
-        paged = jobs[safe_offset : safe_offset + safe_limit]
-
-        items: list[dict[str, Any]] = []
-        for job in paged:
-            search_id = str(job.get("search_id") or "")
-            mentions = list(
-                db.mentions.find(
-                    {
-                        "user_id": user_id,
-                        "$or": [{"search_id": search_id}, {"batch_id": search_id}],
-                    },
-                    {"published_at": 1, "created_at": 1},
-                )
-            )
-
-            values = [
-                item.get("published_at") or item.get("created_at")
-                for item in mentions
-                if isinstance(item.get("published_at") or item.get("created_at"), datetime)
-            ]
-            period_start = min(values).isoformat() if values else None
-            period_end = max(values).isoformat() if values else None
-
-            name = str(job.get("company_name") or job.get("query") or "").strip() or "Empresa"
-            slug = normalize_company_filter(
-                company_slug=str(job.get("company_slug") or "") or None,
-                company_id=name,
-            )
-            if not slug:
-                slug = slugify_company(name)
-
-            items.append(
-                {
-                    "report_id": f"report_{hashlib.sha256(search_id.encode('utf-8')).hexdigest()[:16]}",
-                    "company_name": name,
-                    "company_slug": slug,
-                    "period_from": period_start,
-                    "period_to": period_end,
-                    "created_at": job.get("created_at"),
-                    "report_type": "executive",
-                }
-            )
-
+        paged = all_items[safe_offset : safe_offset + safe_limit]
         return {
-            "total": len(jobs),
+            "total": len(all_items),
             "limit": safe_limit,
             "offset": safe_offset,
-            "items": SearchService.serialize_many(items),
+            "items": SearchService.serialize_many(paged),
         }
 
     @staticmethod
@@ -937,3 +976,337 @@ class ReportService:
             return ReportService._export_pdf_mentions(mentions=mentions, file_label=file_label)
 
         raise ValueError("Formato invalido. Use csv ou pdf")
+
+    @staticmethod
+    def _build_mentions_scope_query(
+        *,
+        user_id: str,
+        company_id: str | None,
+        company_slug: str | None,
+        period_from: datetime | None,
+        period_to: datetime | None,
+        period_days: int | None,
+    ) -> tuple[str, datetime | None, datetime | None, dict[str, Any]]:
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_id)
+        if not normalized_company_slug:
+            raise ValueError("companySlug e obrigatorio para exportacao de relatorios")
+
+        effective_period_from, effective_period_to = ReportService._effective_period_range(
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+
+        if (
+            isinstance(effective_period_from, datetime)
+            and isinstance(effective_period_to, datetime)
+            and effective_period_from > effective_period_to
+        ):
+            raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
+
+        query: dict[str, Any] = {
+            "user_id": user_id,
+            "company_slug": normalized_company_slug,
+        }
+        published_filter: dict[str, Any] = {}
+        if isinstance(effective_period_from, datetime):
+            published_filter["$gte"] = effective_period_from
+        if isinstance(effective_period_to, datetime):
+            published_filter["$lte"] = effective_period_to
+        if published_filter:
+            query["published_at"] = published_filter
+
+        return normalized_company_slug, effective_period_from, effective_period_to, query
+
+    @staticmethod
+    def _load_mentions_by_scope(
+        *,
+        db: Any,
+        query: dict[str, Any],
+        limit: int = 20000,
+    ) -> list[dict[str, Any]]:
+        return list(
+            db.mentions.find(query, {"raw": 0})
+            .sort("published_at", -1)
+            .limit(max(1, min(int(limit), 20000)))
+        )
+
+    @staticmethod
+    def _report_file_label(
+        *,
+        prefix: str,
+        company_slug: str,
+        period_from: datetime | None,
+        period_to: datetime | None,
+    ) -> str:
+        safe_slug = slugify_company(company_slug) or "empresa"
+        from_label = period_from.strftime("%Y%m%d") if isinstance(period_from, datetime) else "inicio"
+        to_label = period_to.strftime("%Y%m%d") if isinstance(period_to, datetime) else "fim"
+        return f"{prefix}-{safe_slug}-{from_label}-{to_label}"
+
+    @staticmethod
+    def export_mentions_csv_canonical(
+        user_id: str,
+        *,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        period_days: int | None = None,
+    ) -> StreamingResponse:
+        db = get_db()
+        if db is None:
+            raise RuntimeError("Banco de dados indisponivel")
+
+        normalized_company_slug, effective_period_from, effective_period_to, query = ReportService._build_mentions_scope_query(
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+        mentions = ReportService._load_mentions_by_scope(db=db, query=query)
+        if not mentions:
+            raise ValueError("Nenhuma mencao encontrada para o filtro informado")
+
+        file_label = ReportService._report_file_label(
+            prefix="mentions",
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+        )
+        return ReportService._export_csv_mentions(mentions=mentions, file_label=file_label)
+
+    @staticmethod
+    def export_dashboard_pdf_canonical(
+        user_id: str,
+        *,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        period_days: int | None = None,
+    ) -> Response:
+        db = get_db()
+        if db is None:
+            raise RuntimeError("Banco de dados indisponivel")
+
+        normalized_company_slug, effective_period_from, effective_period_to, query = ReportService._build_mentions_scope_query(
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+        mentions = ReportService._load_mentions_by_scope(db=db, query=query)
+        if not mentions:
+            raise ValueError("Nenhuma mencao encontrada para o filtro informado")
+
+        file_label = ReportService._report_file_label(
+            prefix="dashboard",
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+        )
+        return ReportService._export_pdf_mentions(mentions=mentions, file_label=file_label)
+
+    @staticmethod
+    def export_insights_pdf_canonical(
+        user_id: str,
+        *,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        period_days: int | None = None,
+        limit: int = 300,
+    ) -> Response:
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_id)
+        if not normalized_company_slug:
+            raise ValueError("companySlug e obrigatorio para exportacao de relatorios")
+
+        effective_period_from, effective_period_to = ReportService._effective_period_range(
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+        if (
+            isinstance(effective_period_from, datetime)
+            and isinstance(effective_period_to, datetime)
+            and effective_period_from > effective_period_to
+        ):
+            raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
+
+        return ReportService.export_insights_pdf(
+            user_id=user_id,
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+            limit=max(1, min(int(limit), 500)),
+        )
+
+    @staticmethod
+    def export_metrics_pdf_canonical(
+        user_id: str,
+        *,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        period_days: int | None = None,
+    ) -> Response:
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_id)
+        if not normalized_company_slug:
+            raise ValueError("companySlug e obrigatorio para exportacao de relatorios")
+
+        effective_period_from, effective_period_to = ReportService._effective_period_range(
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+        if (
+            isinstance(effective_period_from, datetime)
+            and isinstance(effective_period_to, datetime)
+            and effective_period_from > effective_period_to
+        ):
+            raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
+
+        metrics = DashboardService.aggregate_metrics(
+            user_id=user_id,
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+            period_days=period_days,
+            include_raw=False,
+        )
+
+        reportlab = ReportService._load_reportlab_components()
+        if reportlab is None:
+            return Response(
+                content="Exportacao PDF indisponivel neste ambiente (dependencia reportlab ausente).",
+                media_type="text/plain",
+                status_code=503,
+            )
+
+        colors = reportlab["colors"]
+        A4 = reportlab["A4"]
+        getSampleStyleSheet = reportlab["getSampleStyleSheet"]
+        Paragraph = reportlab["Paragraph"]
+        SimpleDocTemplate = reportlab["SimpleDocTemplate"]
+        Spacer = reportlab["Spacer"]
+        Table = reportlab["Table"]
+        TableStyle = reportlab["TableStyle"]
+
+        positive_ratio = float((metrics.get("sentiment_distribution") or {}).get("positive", 0.0) or 0.0)
+        neutral_ratio = float((metrics.get("sentiment_distribution") or {}).get("neutral", 0.0) or 0.0)
+        negative_ratio = float((metrics.get("sentiment_distribution") or {}).get("negative", 0.0) or 0.0)
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+        styles = getSampleStyleSheet()
+        story: list[Any] = []
+
+        story.append(Paragraph("Relatorio de Metricas", styles["Title"]))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(f"Empresa: {metrics.get('company_name') or normalized_company_slug}", styles["Normal"]))
+        story.append(
+            Paragraph(
+                f"Periodo: {metrics.get('period_from') or '-'} ate {metrics.get('period_to') or '-'}",
+                styles["Normal"],
+            )
+        )
+        story.append(Paragraph(f"Gerado em: {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')}", styles["Normal"]))
+        story.append(Spacer(1, 12))
+
+        summary_table = Table(
+            [
+                ["Metrica", "Valor"],
+                ["Total de mencoes", str(int(metrics.get("total_mentions", 0) or 0))],
+                ["Urgencia media", str(round(float(metrics.get("average_urgency", 0.0) or 0.0), 4))],
+                ["Sentimento positivo", f"{positive_ratio * 100:.2f}%"],
+                ["Sentimento neutro", f"{neutral_ratio * 100:.2f}%"],
+                ["Sentimento negativo", f"{negative_ratio * 100:.2f}%"],
+            ],
+            colWidths=[220, 220],
+        )
+        summary_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ]
+            )
+        )
+        story.append(summary_table)
+        story.append(Spacer(1, 12))
+
+        top_negative_aspects = metrics.get("top_negative_aspects") or []
+        if top_negative_aspects:
+            story.append(Paragraph("Top Aspectos Negativos", styles["Heading2"]))
+            negative_table = Table(
+                [["Aspecto", "Mencoes"]]
+                + [
+                    [
+                        str(item.get("label") or ""),
+                        str(int(item.get("mentions", 0) or 0)),
+                    ]
+                    for item in top_negative_aspects[:10]
+                ],
+                colWidths=[320, 120],
+            )
+            negative_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                    ]
+                )
+            )
+            story.append(negative_table)
+            story.append(Spacer(1, 12))
+
+        most_cited_aspects = metrics.get("most_cited_aspects") or []
+        if most_cited_aspects:
+            story.append(Paragraph("Aspectos Mais Citados", styles["Heading2"]))
+            cited_table = Table(
+                [["Aspecto", "Mencoes"]]
+                + [
+                    [
+                        str(item.get("label") or ""),
+                        str(int(item.get("mentions", 0) or 0)),
+                    ]
+                    for item in most_cited_aspects[:10]
+                ],
+                colWidths=[320, 120],
+            )
+            cited_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                    ]
+                )
+            )
+            story.append(cited_table)
+
+        doc.build(story)
+        payload = buffer.getvalue()
+        buffer.close()
+
+        file_label = ReportService._report_file_label(
+            prefix="metrics",
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+        )
+        return Response(
+            content=payload,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{file_label}.pdf"'},
+        )

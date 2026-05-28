@@ -3,10 +3,8 @@ from typing import Any
 from uuid import uuid4
 import re
 
-from fastapi import HTTPException
-
 from app.database import get_db
-from app.services.controlled_context_service import build_authorized_context
+from app.services.controlledcontextservice import build_authorized_context
 from app.services.llm_service import LLMService
 from app.services.normalization_service import utcnow
 from app.services.search_service import SearchService

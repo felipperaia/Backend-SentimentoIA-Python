@@ -1,7 +1,6 @@
 ﻿import json
 import logging
 import re
-import asyncio
 from typing import Any
 
 import httpx
@@ -87,12 +86,12 @@ class LLMService:
     async def _post_json(endpoint: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         base_url = LLMService._base_url()
         if not base_url:
-            logger.warning("OLLAMA_BASE_URL nao configurada; resposta fallback sera usada")
+            logger.warning("OLLAMA_BASE_URL nao configurada")
             return None
 
         model = payload.get("model")
         if not model:
-            logger.warning("OLLAMA_MODEL nao configurado; resposta fallback sera usada")
+            logger.warning("OLLAMA_MODEL nao configurado")
             return None
 
         url = f"{base_url}/{endpoint.lstrip('/')}"
@@ -463,29 +462,17 @@ class LLMService:
             return LLMService.empty_analysis("Sem comentarios processados para gerar insight.")
 
         if not LLMService.ollama_configured():
-            logger.warning("LLM nao configurada; retorno de insight vazio")
-            return LLMService.empty_analysis(
-                "Analise indisponivel no momento.",
-                llm_unavailable=True,
-            )
+            raise RuntimeError("LLM nao configurada para analise de snapshot")
 
         safe_snapshot = LLMService.sanitize_context(snapshot)
         prompt = LLMService.snapshot_prompt(safe_snapshot)
         try:
             response_text = await LLMService._call_ollama_text(prompt, model=LLMService._model())
         except Exception as exc:
-            logger.warning("Falha na chamada LLM durante analise de snapshot: %s", exc)
-            return LLMService.empty_analysis(
-                "Falha temporaria na LLM. Insight nao disponivel no momento.",
-                llm_unavailable=True,
-            )
+            raise RuntimeError("Falha na chamada LLM durante analise de snapshot") from exc
 
         if not response_text:
-            logger.warning("LLM indisponivel durante analise de snapshot; retorno fallback")
-            return LLMService.empty_analysis(
-                "Falha temporaria na LLM. Insight nao disponivel no momento.",
-                llm_unavailable=True,
-            )
+            raise RuntimeError("LLM retornou resposta vazia durante analise de snapshot")
 
         parsed = LLMService.parse_json(response_text)
         normalized = LLMService.normalize_analysis(parsed)
@@ -524,34 +511,23 @@ class LLMService:
     async def analyze_single_mention(text: str) -> dict[str, Any]:
         clean_text = str(text or "").strip()
         if not clean_text:
-            return LLMService._build_single_mention_result(
-                sentiment="neutro",
-                llm_urgency_score=0.0,
-                confidence_score=0.5,
-                aspect_sentiment={},
-                summary="Texto vazio para analise.",
-                text="",
-            )
+            raise ValueError("Texto vazio para analise")
 
         if not LLMService.ollama_configured():
-            logger.warning("LLM nao configurada para analise individual; fallback aplicado")
-            return LLMService._build_single_mention_result(
-                sentiment="neutro",
-                llm_urgency_score=0.0,
-                confidence_score=0.4,
-                aspect_sentiment={},
-                summary="Analise feita em modo fallback por indisponibilidade da LLM.",
-                text=clean_text,
-            )
+            raise RuntimeError("LLM nao configurada para analise individual")
 
         messages = LLMService._single_mention_messages(clean_text)
         try:
             response_text = await LLMService.call_ollama_chat(messages)
         except Exception as exc:
-            logger.warning("Falha na chamada LLM para analise individual: %s", exc)
-            response_text = ""
+            raise RuntimeError("Falha na chamada LLM para analise individual") from exc
 
-        parsed = LLMService.parse_json(response_text) if response_text else {}
+        if not response_text:
+            raise RuntimeError("LLM retornou resposta vazia para analise individual")
+
+        parsed = LLMService.parse_json(response_text)
+        if not parsed:
+            raise RuntimeError("LLM retornou payload invalido para analise individual")
 
         return LLMService._build_single_mention_result(
             sentiment=parsed.get("sentiment"),
@@ -563,26 +539,10 @@ class LLMService:
         )
 
     @staticmethod
-    def analyze_single_mention_sync(text: str) -> dict[str, Any]:
-        try:
-            asyncio.get_running_loop()
-            return LLMService._build_single_mention_result(
-                sentiment="neutro",
-                llm_urgency_score=0.0,
-                confidence_score=0.4,
-                aspect_sentiment={},
-                summary="Analise fallback aplicada por contexto de loop em execucao.",
-                text=str(text or ""),
-            )
-        except RuntimeError:
-            return asyncio.run(LLMService.analyze_single_mention(text))
-
-    @staticmethod
     async def answer_domain_chat(
         messages: list | None = None,
         authorized_context: dict | None = None,
         fail_on_unavailable: bool = False,
-        **legacy_kwargs: Any,
     ) -> str:
         del fail_on_unavailable
 
@@ -594,36 +554,19 @@ class LLMService:
             )
 
         try:
-            if legacy_kwargs:
-                safe_context = LLMService._redact_for_prompt(authorized_context or {})
-                safe_history = LLMService._redact_for_prompt(legacy_kwargs.get("history") or [])
-                user_message = LLMService._redact_text(legacy_kwargs.get("user_message") or "")
-                rendered_prompt = "\n\n".join(
-                    [
-                        str(legacy_kwargs.get("system_prompt") or "Sistema SentimentoIA"),
-                        f"Locale: {legacy_kwargs.get('locale') or 'pt-BR'}",
-                        f"Base de conhecimento:\n{LLMService._redact_text(legacy_kwargs.get('knowledge_base') or '')}",
-                        "Intencoes permitidas: get_user_dashboard_summary, list_mentions, generate_insight, explain_dashboard",
-                        "Contexto autorizado:\n"
-                        f"{json.dumps(safe_context, ensure_ascii=False, default=str)}",
-                        "Historico:\n"
-                        f"{json.dumps(safe_history, ensure_ascii=False, default=str)}",
-                        f"Mensagem do usuario:\n{user_message}",
-                    ]
-                )
-                response = await LLMService._call_ollama_text(
-                    rendered_prompt,
-                    model=legacy_kwargs.get("model") or LLMService._model(),
-                )
-                if response:
-                    return response
-                raise HTTPException(
-                    status_code=503,
-                    detail="LLM temporariamente indisponível. Tente novamente em instantes.",
-                )
-
             safe_context = LLMService.sanitize_context(authorized_context or {})
             safe_messages: list[dict[str, str]] = []
+
+            safe_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Voce e um assistente do SentimentoIA. "
+                        "Responda somente com base nos dados autorizados e no historico fornecido. "
+                        "Nao invente fontes, IDs ou dados que nao estejam no contexto autorizado."
+                    ),
+                }
+            )
 
             if safe_context:
                 safe_messages.append(
@@ -653,12 +596,7 @@ class LLMService:
                     detail="LLM temporariamente indisponível. Tente novamente em instantes.",
                 )
 
-            prompt_parts = [f"{item.get('role', 'user').upper()}:\n{item.get('content', '')}" for item in safe_messages]
-            rendered_prompt = "\n\n".join(prompt_parts)
-            response = await LLMService._call_ollama_text(
-                rendered_prompt,
-                model=LLMService._model(),
-            )
+            response = await LLMService.call_ollama_chat(safe_messages)
             if not response:
                 logger.warning("Chat LLM retornou vazio")
                 raise HTTPException(

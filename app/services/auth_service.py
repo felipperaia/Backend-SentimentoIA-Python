@@ -496,11 +496,13 @@ class AuthService:
                     legacy_result.deleted_count
                 )
 
-            # Dados demo em banco secundário (quando configurado).
+            # Dados de staging de ingestão em banco secundário (quando configurado).
             try:
                 secondary_db = get_secondary_db()
-                result = secondary_db.demo_dashboard_snapshots.delete_many({"user_id": user_id})
-                deleted_counts["demo_dashboard_snapshots"] = int(result.deleted_count)
+                mentions_result = secondary_db.ingestion_staging_mentions.delete_many({"user_id": user_id})
+                batches_result = secondary_db.ingestion_staging_batches.delete_many({"user_id": user_id})
+                deleted_counts["ingestion_staging_mentions"] = int(mentions_result.deleted_count)
+                deleted_counts["ingestion_staging_batches"] = int(batches_result.deleted_count)
             except RuntimeError:
                 pass
 

@@ -51,7 +51,7 @@ class ProcessingService:
         )
 
     @staticmethod
-    def process_pending_mentions(limit: int = 50) -> dict[str, int]:
+    async def process_pending_mentions(limit: int = 50) -> dict[str, int]:
         db = get_db()
         if db is None:
             return {"found": 0, "processed": 0, "errors": 0}
@@ -99,7 +99,7 @@ class ProcessingService:
                     raise ValueError("comentario sem texto valido")
 
                 enrichment = EnrichmentService.analyze_mention(text, mention.get("rating"))
-                llm_analysis = LLMService.analyze_single_mention_sync(text)
+                llm_analysis = await LLMService.analyze_single_mention(text)
 
                 merged_aspects = list(enrichment.get("aspects") or [])
                 for aspect in (llm_analysis.get("aspect_sentiment") or {}).keys():

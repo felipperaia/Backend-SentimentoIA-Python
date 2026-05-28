@@ -55,14 +55,6 @@ class MongoDB:
             cls.db.mentions.create_index([("user_id", 1), ("source", 1), ("published_at", -1)])
             cls.db.mentions.create_index([("user_id", 1), ("created_at", -1), ("criticality", 1)])
 
-            cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("created_at", -1)])
-            cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("canonical_url", 1)])
-            cls.db.scraped_items.create_index([("source", 1), ("query_key", 1), ("content_hash", 1)])
-
-            cls.db.source_checkpoints.create_index([("source", 1), ("query_key", 1)], unique=True)
-            cls.db.monitor_sources.create_index("name", unique=True)
-            cls.db.monitor_sources.create_index([("active", 1), ("priority", -1)])
-
             cls.db.comment_batches.create_index([("user_id", 1), ("created_at", -1)])
             cls.db.comment_batches.create_index("batch_id", unique=True)
 
@@ -75,8 +67,6 @@ class MongoDB:
             cls.db.alerts.create_index([("user_id", 1), ("search_id", 1), ("created_at", -1)])
             cls.db.reports.create_index([("user_id", 1), ("search_id", 1), ("created_at", -1)])
             cls.db.audit_logs.create_index([("user_id", 1), ("created_at", -1)])
-            cls.db.demo_context_links.create_index([("user_id", 1), ("context_id", 1)], unique=True)
-            cls.db.demo_context_links.create_index([("user_id", 1), ("company_slug", 1), ("updated_at", -1)])
 
             cls.db.nps_responses.create_index([("user_id", 1), ("created_at", -1)])
             cls.db.nps_responses.create_index([("session_id", 1), ("created_at", -1)])
@@ -92,16 +82,20 @@ class MongoDB:
 
     @classmethod
     async def create_secondary_indexes(cls):
-        """Índices para snapshots de dashboard em banco secundário (demo)."""
+        """Índices de staging de ingestão JSON no banco secundário."""
         if cls.secondary_db is None:
             return
 
         try:
-            snapshots = cls.secondary_db.demo_dashboard_snapshots
-            snapshots.create_index("user_id")
-            snapshots.create_index([("user_id", 1), ("company_slug", 1)])
-            snapshots.create_index([("user_id", 1), ("company_slug", 1), ("period_from", 1), ("period_to", 1)])
-            snapshots.create_index([("user_id", 1), ("company_slug", 1), ("batch_key", 1)])
+            staging_mentions = cls.secondary_db.ingestion_staging_mentions
+            staging_mentions.create_index([("user_id", 1), ("company_slug", 1), ("source", 1), ("published_at", -1)])
+            staging_mentions.create_index([("user_id", 1), ("batch_id", 1), ("published_at", -1)])
+            staging_mentions.create_index([("user_id", 1), ("company_slug", 1), ("published_at", -1)])
+            staging_mentions.create_index([("user_id", 1), ("staging_hash", 1)], unique=True)
+
+            staging_batches = cls.secondary_db.ingestion_staging_batches
+            staging_batches.create_index("batch_id", unique=True)
+            staging_batches.create_index([("user_id", 1), ("created_at", -1)])
             logger.info("✓ Índices do MongoDB secundário criados com sucesso")
         except Exception as exc:
             logger.error("✗ Erro ao criar índices do MongoDB secundário: %s", exc)
@@ -113,7 +107,7 @@ def get_db():
 
 
 def get_secondary_db():
-    """Retorna instância ativa do MongoDB secundário para dados demo."""
+    """Retorna instância ativa do MongoDB secundário para staging de ingestão."""
     if MongoDB.secondary_db is None:
         raise RuntimeError(
             "Secondary MongoDB is not configured. Configure SECONDARY_MONGODB_URI and SECONDARY_DATABASE_NAME."

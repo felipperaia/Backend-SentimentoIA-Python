@@ -1,5 +1,7 @@
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
+import hashlib
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +35,52 @@ class InsightGenerationError(ValueError):
 
 class InsightService:
     @staticmethod
+    def _to_json_compatible(value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(key): InsightService._to_json_compatible(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [InsightService._to_json_compatible(item) for item in value]
+        return value
+
+    @staticmethod
+    def _filters_hash(filters: dict[str, Any] | None = None) -> str:
+        payload = InsightService._to_json_compatible(filters or {})
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _insight_cache_key(
+        *,
+        user_id: str,
+        company_slug: str,
+        period_from: datetime | None,
+        period_to: datetime | None,
+        filters_hash: str,
+    ) -> str:
+        period_from_iso = period_from.isoformat() if isinstance(period_from, datetime) else ""
+        period_to_iso = period_to.isoformat() if isinstance(period_to, datetime) else ""
+        seed = f"{user_id}|{company_slug}|{period_from_iso}|{period_to_iso}|{filters_hash}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _effective_period_range(
+        *,
+        period_from: datetime | None,
+        period_to: datetime | None,
+        period_days: int | None,
+    ) -> tuple[datetime | None, datetime | None]:
+        if isinstance(period_from, datetime) or isinstance(period_to, datetime):
+            return period_from, period_to
+
+        if period_days and int(period_days) > 0:
+            now = utcnow()
+            return (now - timedelta(days=int(period_days))).replace(microsecond=0), now.replace(microsecond=0)
+
+        return None, None
+
+    @staticmethod
     def _default_dashboard_settings(user_id: str) -> dict[str, Any]:
         now = utcnow()
         return {
@@ -58,7 +106,7 @@ class InsightService:
             return_document=ReturnDocument.AFTER,
         )
         if not current:
-            # Fallback defensivo para cenarios raros de retorno nulo.
+            # Consulta adicional defensiva para cenarios raros de retorno nulo.
             current = db.dashboard_settings.find_one({"user_id": user_id})
         if not current:
             raise RuntimeError("Falha ao inicializar dashboard_settings")
@@ -594,50 +642,159 @@ class InsightService:
         return required_defaults
 
     @staticmethod
-    def _fallback_analysis_from_snapshot(snapshot: dict[str, Any], reason: str) -> dict[str, Any]:
-        distribution = snapshot.get("sentiment_distribution") if isinstance(snapshot.get("sentiment_distribution"), dict) else {}
-        negative_count = int(distribution.get("negativo", distribution.get("negative", 0)) or 0)
-        total_comments = int(snapshot.get("total_comments", snapshot.get("total_mentions", 0)) or 0)
-        average_urgency = float(snapshot.get("average_urgency", 0) or 0)
+    def _build_snapshot_for_company_filters(
+        *,
+        user_id: str,
+        company_slug: str,
+        period_from: datetime | None,
+        period_to: datetime | None,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        db = get_db()
+        if db is None:
+            raise RuntimeError(DB_UNAVAILABLE_ERROR)
 
-        if total_comments > 0:
-            negative_ratio = negative_count / total_comments
+        query: dict[str, Any] = {
+            "user_id": user_id,
+            "company_slug": company_slug,
+        }
+
+        published_filter: dict[str, Any] = {}
+        if isinstance(period_from, datetime):
+            published_filter["$gte"] = period_from
+        if isinstance(period_to, datetime):
+            published_filter["$lte"] = period_to
+        if published_filter:
+            query["published_at"] = published_filter
+
+        source_filters = (filters or {}).get("sources")
+        if isinstance(source_filters, list) and source_filters:
+            normalized_sources = [str(item).strip().lower() for item in source_filters if str(item).strip()]
+            if normalized_sources:
+                query["source"] = {"$in": normalized_sources}
+
+        mentions = list(
+            db.mentions.find(query, {"raw": 0})
+            .sort("published_at", -1)
+            .limit(5000)
+        )
+
+        if not mentions:
+            raise ValueError("Nao ha mencoes no periodo para gerar insight")
+
+        metrics = EnrichmentService.aggregate(mentions)
+        sentiment_distribution = metrics.get("sentiment_distribution") or {}
+        positive_count = int(sentiment_distribution.get("positivo", sentiment_distribution.get("positive", 0)) or 0)
+        negative_count = int(sentiment_distribution.get("negativo", sentiment_distribution.get("negative", 0)) or 0)
+        neutral_count = int(sentiment_distribution.get("neutro", sentiment_distribution.get("neutral", 0)) or 0)
+
+        critical_terms_counter: Counter[str] = Counter()
+        for mention in mentions:
+            for term in mention.get("critical_terms") or []:
+                critical_terms_counter[str(term)] += 1
+
+        negative_mentions = [
+            mention
+            for mention in mentions
+            if str(mention.get("sentiment") or "").lower() in {"negativo", "negative"}
+        ]
+        negative_mentions.sort(
+            key=lambda item: (
+                1 if str(item.get("criticality") or "").lower() in {"alta", "high", "critical"} else 0,
+                float(item.get("urgency_score") or 0),
+            ),
+            reverse=True,
+        )
+        top_negative_texts = [str(item.get("text") or "")[:500] for item in negative_mentions[:10] if item.get("text")]
+
+        positive_mentions = [
+            mention
+            for mention in mentions
+            if str(mention.get("sentiment") or "").lower() in {"positivo", "positive"}
+        ]
+        positive_mentions.sort(key=lambda item: float(item.get("reputation_score") or 0), reverse=True)
+        top_positive_texts = [str(item.get("text") or "")[:500] for item in positive_mentions[:5] if item.get("text")]
+
+        source_distribution = Counter(str(mention.get("source") or "unknown") for mention in mentions)
+        criticality_distribution = Counter(str(mention.get("criticality") or "unknown") for mention in mentions)
+
+        available_dates = [
+            mention.get("published_at") or mention.get("created_at")
+            for mention in mentions
+            if isinstance(mention.get("published_at") or mention.get("created_at"), datetime)
+        ]
+        inferred_period_from = min(available_dates) if available_dates else None
+        inferred_period_to = max(available_dates) if available_dates else None
+        effective_period_from = period_from or inferred_period_from
+        effective_period_to = period_to or inferred_period_to
+
+        if effective_period_from and effective_period_to:
+            date_range = {
+                "start": effective_period_from.isoformat(),
+                "end": effective_period_to.isoformat(),
+            }
+            period = f"{effective_period_from.date().isoformat()}/{effective_period_to.date().isoformat()}"
         else:
-            negative_ratio = 0.0
+            date_range = {"start": None, "end": None}
+            period = "indefinido"
 
-        if average_urgency >= 0.7 or negative_ratio >= 0.45:
-            priority = "high"
-            trend = "worsening"
-        elif average_urgency >= 0.4 or negative_ratio >= 0.25:
-            priority = "medium"
-            trend = "stable"
-        else:
-            priority = "low"
-            trend = "improving"
+        max_samples = max(1, int(settings.LLM_MAX_SAMPLE_MENTIONS))
+        sample_mentions = [
+            {
+                "text": (mention.get("text") or "")[:500],
+                "sentiment": mention.get("sentiment"),
+                "criticality": mention.get("criticality"),
+                "urgency_score": mention.get("urgency_score"),
+                "source": mention.get("source"),
+            }
+            for mention in mentions[:max_samples]
+        ]
 
-        top_terms = snapshot.get("top_critical_terms") if isinstance(snapshot.get("top_critical_terms"), list) else []
-        main_term = str(top_terms[0]) if top_terms else "insatisfacao recorrente"
+        source_references = [
+            {
+                "mention_id": str(mention.get("_id") or ""),
+                "source": str(mention.get("source") or "unknown"),
+                "url": str(mention.get("url") or ""),
+                "canonical_url": str(mention.get("canonical_url") or ""),
+                "published_at": mention.get("published_at").isoformat()
+                if isinstance(mention.get("published_at"), datetime)
+                else mention.get("published_at"),
+            }
+            for mention in mentions[:50]
+        ]
+
+        company_name = str(mentions[0].get("company_name") or mentions[0].get("query") or company_slug)
 
         return {
-            "executive_summary": f"Analise automatica indisponivel. Fallback aplicado: {reason}",
-            "sentiment_overview": (
-                f"Volume analisado: {total_comments}. "
-                f"Negativas: {negative_count}. "
-                f"Urgencia media: {round(average_urgency, 2)}."
-            ),
-            "priority": priority,
-            "risks": [f"Escalada de mencoes relacionadas a {main_term}"],
-            "opportunities": ["Atuar rapidamente nos temas criticos para reduzir detracao"],
-            "recommended_actions": [
-                "Priorizar tratativas de alto impacto",
-                "Responder mencoes criticas com SLA reduzido",
-            ],
-            "decision_guidance": "Aplicar plano tatico enquanto a analise de IA nao estiver disponivel.",
-            "trend": trend,
-            "source_references": snapshot.get("source_references") if isinstance(snapshot.get("source_references"), list) else [],
-            "resolution": "pending",
-            "llm_unavailable": True,
-            "fallback_used": True,
+            "batch_id": None,
+            "search_id": None,
+            "context_id": None,
+            "context_type": "company_period",
+            "brand": company_name,
+            "company_name": company_name,
+            "company_slug": company_slug,
+            "query": company_name,
+            "period": period,
+            "period_from": effective_period_from,
+            "period_to": effective_period_to,
+            "date_range": date_range,
+            "total_mentions": len(mentions),
+            "total_comments": len(mentions),
+            "positive_count": positive_count,
+            "negative_count": negative_count,
+            "neutral_count": neutral_count,
+            "sentiment_distribution": sentiment_distribution,
+            "critical_mentions": int(metrics.get("critical_mentions", 0)),
+            "average_urgency": float(metrics.get("average_urgency", 0)),
+            "top_themes": list((metrics.get("top_aspects") or {}).keys())[:5],
+            "top_negative_texts": top_negative_texts,
+            "top_positive_texts": top_positive_texts,
+            "source_distribution": dict(source_distribution),
+            "criticality_distribution": dict(criticality_distribution),
+            "source_references": source_references,
+            "sample_mentions": sample_mentions,
+            "top_aspects": list((metrics.get("top_aspects") or {}).keys())[:10],
+            "top_critical_terms": [term for term, _ in critical_terms_counter.most_common(10)],
         }
 
     @staticmethod
@@ -750,24 +907,11 @@ class InsightService:
                 )
                 analysis_raw = await LLMService.analyze_snapshot(snapshot=snapshot, user_id=user_id)
                 if not isinstance(analysis_raw, dict):
-                    analysis_raw = {}
+                    raise RuntimeError("Resposta da LLM invalida para geracao de insight")
 
-                llm_unavailable = bool(analysis_raw.get("llm_unavailable"))
-                fallback_used = False
-                analysis_source = analysis_raw
-                if llm_unavailable:
-                    fallback_used = True
-                    analysis_source = InsightService._fallback_analysis_from_snapshot(
-                        snapshot=snapshot,
-                        reason=str(
-                            analysis_raw.get("executive_summary")
-                            or "IA indisponivel"
-                        ),
-                    )
-
-                analysis = LLMService.normalize_analysis(analysis_source)
+                llm_unavailable = False
+                analysis = LLMService.normalize_analysis(analysis_raw)
                 analysis["llm_unavailable"] = llm_unavailable
-                analysis["fallback_used"] = fallback_used
 
                 processed_count_now = InsightService._context_mentions_count(
                     user_id=user_id,
@@ -787,7 +931,6 @@ class InsightService:
                     "job_trigger": str(job.get("trigger") or "auto"),
                     "deterministic_rules_version": "priority-v1",
                     "llm_unavailable": llm_unavailable,
-                    "fallback_used": fallback_used,
                 }
                 operational_fields = InsightService._build_operational_fields(snapshot=snapshot, analysis=analysis)
                 insight_doc = {
@@ -818,7 +961,6 @@ class InsightService:
                         "raw": analysis_raw,
                     },
                     "llm_unavailable": llm_unavailable,
-                    "fallback_used": fallback_used,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -870,6 +1012,19 @@ class InsightService:
         if not include_archived:
             conditions.append({"archived": False})
 
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_slug)
+        if not normalized_company_slug:
+            return []
+
+        conditions.append({"company_slug": normalized_company_slug})
+
+        if (
+            isinstance(period_from, datetime)
+            and isinstance(period_to, datetime)
+            and period_from > period_to
+        ):
+            return []
+
         if batch_id:
             conditions.append(
                 {
@@ -881,45 +1036,10 @@ class InsightService:
                 }
             )
 
-        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_slug)
-        if normalized_company_slug:
-            conditions.append(
-                {
-                    "$or": [
-                        {"company_slug": normalized_company_slug},
-                        {"snapshot.company_slug": normalized_company_slug},
-                    ]
-                }
-            )
-
         if period_from:
-            conditions.append(
-                {
-                    "$or": [
-                        {"period_to": {"$gte": period_from}},
-                        {
-                            "$and": [
-                                {"period_to": {"$exists": False}},
-                                {"created_at": {"$gte": period_from}},
-                            ]
-                        },
-                    ]
-                }
-            )
+            conditions.append({"period_to": {"$gte": period_from}})
         if period_to:
-            conditions.append(
-                {
-                    "$or": [
-                        {"period_from": {"$lte": period_to}},
-                        {
-                            "$and": [
-                                {"period_from": {"$exists": False}},
-                                {"created_at": {"$lte": period_to}},
-                            ]
-                        },
-                    ]
-                }
-            )
+            conditions.append({"period_from": {"$lte": period_to}})
 
         if priority:
             conditions.append({"priority": InsightService._normalize_priority(priority, fallback="medium")})
@@ -936,97 +1056,144 @@ class InsightService:
     @staticmethod
     async def generate_insight(
         user_id: str,
-        batch_id: str | None = None,
+        *,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        period_days: int | None = None,
         force: bool = False,
+        filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         db = get_db()
         if db is None:
             raise RuntimeError(DB_UNAVAILABLE_ERROR)
 
-        if batch_id:
-            try:
-                context_type, context_id = InsightService._resolve_context(
-                    user_id=user_id,
-                    context_id=batch_id,
-                    context_type=None,
-                )
-            except ValueError as exc:
-                raise ValueError(str(exc)) from exc
-        else:
-            context_type, context_id = InsightService._latest_context(user_id=user_id)
+        normalized_company_slug = normalize_company_filter(company_slug=company_slug, company_id=company_slug)
+        if not normalized_company_slug:
+            raise ValueError("company_slug e obrigatorio para gerar insight")
 
-        enqueue_result = InsightService.enqueue_job_if_threshold_reached(
-            user_id=user_id,
-            context_id=context_id,
-            trigger="manual",
-            force=force,
-            context_type=context_type,
+        effective_period_from, effective_period_to = InsightService._effective_period_range(
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
         )
 
-        if not enqueue_result.get("queued") and not force:
-            reason = enqueue_result.get("reason", "nao_enfileirado")
-            details: dict[str, Any] = {
-                "reason": reason,
-                "context_id": context_id,
-                "context_type": context_type,
-            }
+        if (
+            isinstance(effective_period_from, datetime)
+            and isinstance(effective_period_to, datetime)
+            and effective_period_from > effective_period_to
+        ):
+            raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
 
-            if reason == "threshold_not_met":
-                threshold = int(enqueue_result.get("threshold") or InsightService.get_threshold(user_id=user_id))
-                processed_count = int(enqueue_result.get("processed_count") or 0)
-                missing_count = max(0, threshold - processed_count)
-                details.update(
-                    {
-                        "threshold": threshold,
-                        "processed_count": processed_count,
-                        "missing_count": missing_count,
-                        "actionable_message": (
-                            f"Sao necessarias pelo menos {threshold} mencoes processadas para gerar insight. "
-                            f"Atualmente existem {processed_count}."
-                        ),
-                    }
-                )
-                raise InsightGenerationError(
-                    code="threshold_not_met",
-                    message="Ainda nao ha mencoes suficientes para gerar insight.",
-                    details=details,
-                )
+        safe_filters = {"scope": "insight", **(filters or {})}
+        filters_hash = InsightService._filters_hash(safe_filters)
+        cache_key = InsightService._insight_cache_key(
+            user_id=user_id,
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+            filters_hash=filters_hash,
+        )
 
-            if reason == "active_job_exists":
-                details["job_id"] = enqueue_result.get("job_id")
-                raise InsightGenerationError(
-                    code="active_job_exists",
-                    message="Ja existe uma geracao de insight em andamento para este contexto.",
-                    details=details,
-                )
-
-            if reason == "active_insight_exists":
-                details["insight_id"] = enqueue_result.get("insight_id")
-                raise InsightGenerationError(
-                    code="active_insight_exists",
-                    message="Ja existe um insight ativo para este contexto. Use regenerar para atualizar.",
-                    details=details,
-                )
-
-            raise InsightGenerationError(
-                code="enqueue_failed",
-                message="Nao foi possivel enfileirar insight no momento.",
-                details=details,
-            )
-
-        await InsightService.process_queued_jobs(limit=1)
-
-        generated = db.insights.find_one(
+        existing = db.insights.find_one(
             {
                 "user_id": user_id,
-                "context_id": context_id,
-                "context_type": context_type,
+                "cache_key": cache_key,
+                "archived": False,
             },
-            sort=[("created_at", -1)],
+            sort=[("updated_at", -1), ("created_at", -1)],
         )
-        if not generated:
+
+        if existing and not force:
+            return SearchService.serialize(existing)
+
+        try:
+            snapshot = InsightService._build_snapshot_for_company_filters(
+                user_id=user_id,
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+                filters=safe_filters,
+            )
+        except ValueError as exc:
+            raise InsightGenerationError(
+                code="empty_scope",
+                message="Nao ha mencoes para a empresa e faixa de datas informadas.",
+                details={
+                    "company_slug": normalized_company_slug,
+                    "period_from": effective_period_from.isoformat() if isinstance(effective_period_from, datetime) else None,
+                    "period_to": effective_period_to.isoformat() if isinstance(effective_period_to, datetime) else None,
+                },
+            ) from exc
+
+        analysis_raw = await LLMService.analyze_snapshot(snapshot=snapshot, user_id=user_id)
+        if not isinstance(analysis_raw, dict):
+            raise RuntimeError("Resposta da LLM invalida para geracao de insight")
+
+        llm_unavailable = False
+        analysis = LLMService.normalize_analysis(analysis_raw)
+        analysis["llm_unavailable"] = llm_unavailable
+
+        now = utcnow()
+        operational_fields = InsightService._build_operational_fields(snapshot=snapshot, analysis=analysis)
+
+        if existing:
+            insight_id = str(existing.get("insight_id") or existing.get("_id") or "")
+        else:
+            insight_id = f"insight_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+
+        update_payload = {
+            "insight_id": insight_id,
+            "user_id": user_id,
+            "context_id": cache_key,
+            "context_type": "company_period",
+            "trigger": "manual",
+            "archived": False,
+            "cache_scope": "company_period",
+            "cache_key": cache_key,
+            "filters_hash": filters_hash,
+            "filters_payload": safe_filters,
+            "company_slug": normalized_company_slug,
+            "period_from": effective_period_from,
+            "period_to": effective_period_to,
+            **operational_fields,
+            "source_references": snapshot.get("source_references", []),
+            "source_distribution": snapshot.get("source_distribution", {}),
+            "snapshot": snapshot,
+            "executive_summary": analysis.get("executive_summary") or "Analise indisponivel no momento.",
+            "sentiment_overview": analysis.get("sentiment_overview") or "Resumo de sentimento indisponivel.",
+            "risks": analysis.get("risks") if isinstance(analysis.get("risks"), list) else [],
+            "opportunities": analysis.get("opportunities") if isinstance(analysis.get("opportunities"), list) else [],
+            "recommended_actions": analysis.get("recommended_actions") if isinstance(analysis.get("recommended_actions"), list) else [],
+            "decision_guidance": analysis.get("decision_guidance") or "Direcionamento indisponivel.",
+            "trend": analysis.get("trend") or "stable",
+            "llm_payload": {
+                **analysis,
+                "raw": analysis_raw,
+            },
+            "llm_unavailable": llm_unavailable,
+            "updated_at": now,
+        }
+
+        if existing:
+            db.insights.update_one(
+                {"_id": existing.get("_id"), "user_id": user_id},
+                {"$set": update_payload},
+            )
+            saved = db.insights.find_one({"_id": existing.get("_id"), "user_id": user_id})
+        else:
+            insight_doc = {
+                "_id": insight_id,
+                "created_at": now,
+                **update_payload,
+            }
+            db.insights.insert_one(insight_doc)
+            saved = insight_doc
+
+        if not saved:
             raise RuntimeError("Insight nao foi gerado")
-        return SearchService.serialize(generated)
+
+        return SearchService.serialize(saved)
 
     @staticmethod
     async def regenerate_insight(user_id: str, insight_id: str) -> dict[str, Any]:
@@ -1038,34 +1205,22 @@ class InsightService:
         if not current:
             raise ValueError("Insight nao encontrado")
 
-        context_id = str(current.get("context_id") or current.get("batch_id") or current.get("search_id") or "")
-        context_type = str(current.get("context_type") or ("batch" if current.get("batch_id") else "search"))
-        if not context_id:
-            raise RuntimeError("Insight sem contexto para regeneracao")
+        normalized_company_slug = normalize_company_filter(
+            company_slug=str(current.get("company_slug") or "") or None,
+            company_id=str(current.get("company_name") or current.get("company") or "") or None,
+        )
+        if not normalized_company_slug:
+            raise RuntimeError("Insight sem company_slug para regeneracao")
 
-        enqueue_result = InsightService.enqueue_job_if_threshold_reached(
+        filters_payload = current.get("filters_payload") if isinstance(current.get("filters_payload"), dict) else {}
+        return await InsightService.generate_insight(
             user_id=user_id,
-            context_id=context_id,
-            trigger="regenerate",
+            company_slug=normalized_company_slug,
+            period_from=current.get("period_from") if isinstance(current.get("period_from"), datetime) else None,
+            period_to=current.get("period_to") if isinstance(current.get("period_to"), datetime) else None,
             force=True,
-            context_type=context_type,
+            filters=filters_payload,
         )
-        if not enqueue_result.get("queued"):
-            raise RuntimeError("Nao foi possivel enfileirar regeneracao")
-
-        await InsightService.process_queued_jobs(limit=1)
-
-        regenerated = db.insights.find_one(
-            {
-                "user_id": user_id,
-                "context_id": context_id,
-                "context_type": context_type,
-            },
-            sort=[("created_at", -1)],
-        )
-        if not regenerated:
-            raise RuntimeError("Insight nao foi regenerado")
-        return SearchService.serialize(regenerated)
 
     @staticmethod
     def archive_insight(user_id: str, insight_id: str) -> bool:

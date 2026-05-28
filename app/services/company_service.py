@@ -4,7 +4,6 @@ from typing import Any
 
 from app.database import get_db
 from app.services.company_utils import normalize_company_filter, slugify_company
-from app.services.demo_service import DemoService
 
 
 class CompanyService:
@@ -89,24 +88,5 @@ class CompanyService:
         if db is None:
             raise RuntimeError("Banco de dados indisponivel")
 
-        merged: dict[str, dict[str, str]] = {}
-
-        for item in CompanyService._collect_from_primary(db=db, user_id=user_id):
-            merged[item["slug"]] = item
-
-        try:
-            for item in DemoService.list_companies_from_demo(user_id=user_id):
-                slug = str(item.get("slug") or "").strip()
-                if not slug:
-                    continue
-                if slug not in merged:
-                    merged[slug] = {
-                        "company_id": slug,
-                        "name": str(item.get("name") or slug),
-                        "slug": slug,
-                    }
-        except RuntimeError:
-            # MongoDB secundario nao configurado: lista continua baseada no banco principal.
-            pass
-
-        return sorted(merged.values(), key=lambda item: str(item.get("name") or "").lower())
+        items = CompanyService._collect_from_primary(db=db, user_id=user_id)
+        return sorted(items, key=lambda item: str(item.get("name") or "").lower())

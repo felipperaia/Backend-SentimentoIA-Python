@@ -1,166 +1,58 @@
 # SentimentoIA Backend
 
-Backend da plataforma SentimentoIA, responsavel por autenticacao, coleta de mencoes, analise de sentimento, insights e dados para dashboard.
+Backend FastAPI da plataforma SentimentoIA.
 
-## O que o sistema faz
+## Arquitetura atual
 
-- autentica usuarios (JWT)
-- coleta mencoes de diferentes fontes
-- classifica sentimento e urgencia
-- gera dados para dashboard e relatorios
-- oferece chat de apoio ao dominio da aplicacao
+- Sem scraper.
+- Sem demo/seed/fallback.
+- MongoDB primario (`MONGODB_URI`) e secundario (`SECONDARY_MONGODB_URI`).
+- Banco secundario: staging de ingestao JSON.
+- Banco primario: unica fonte de leitura da aplicacao.
+- Chatbot responde via LLM (Ollama HTTP).
+- Execucao em producao (HostingGuru), sem Docker e sem Redis.
 
-## Como funciona (visao simples)
+## Fluxo de dados
 
-Fluxo principal:
-
-1. Usuario faz login.
-2. Usuario executa busca/coleta.
-3. Backend salva mencoes no MongoDB.
-4. Sistema aplica analise (sentimento, urgencia, aspectos).
-5. Dashboard e endpoints de metricas mostram os resultados.
-
-## Componentes principais
-
-- API: FastAPI
-- Banco: MongoDB
-- IA: Ollama (quando configurado)
-- Worker: processamento de lote em segundo plano
-
-## Estrutura resumida
-
-```text
-app/                    # codigo principal da API
-app/api/                # rotas HTTP
-app/services/           # regras de negocio
-app/schemas/            # validacao de entrada/saida
-apps/worker/            # worker de processamento
-tests/                  # testes automatizados
-.env.example            # exemplo de variaveis de ambiente
-```
-
-## Pre-requisitos
-
-- Python 3.13 (recomendado no projeto atual)
-- MongoDB acessivel
-- Ollama acessivel (opcional, para recursos de IA)
-
-## Setup rapido
-
-### Windows (PowerShell)
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-### Linux/macOS
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-cp .env.example .env
-```
+1. Frontend envia lote JSON para `POST /api/ingestion/comments` (staging no Mongo secundario).
+2. Frontend dispara `POST /api/search` para importar staging filtrado ao Mongo primario.
+3. Dashboard/metrics/insights/chat leem somente do Mongo primario.
 
 ## Variaveis essenciais (.env)
 
+- `SECRET_KEY`
+- `ALGORITHM`
+- `ACCESS_TOKEN_EXPIRE_MINUTES`
+- `REFRESH_TOKEN_EXPIRE_DAYS`
 - `MONGODB_URI`
 - `DATABASE_NAME`
-- `SECONDARY_MONGODB_URI` (seed/demo)
-- `SECONDARY_DATABASE_NAME` (seed/demo)
-- `SECRET_KEY`
-- `FRONTEND_URL`
+- `SECONDARY_MONGODB_URI`
+- `SECONDARY_DATABASE_NAME`
 - `CORS_ORIGINS_CSV`
-- `OLLAMA_BASE_URL` (se usar IA)
-- `OLLAMA_MODEL` (se usar IA)
-
-## Fluxo de Seeds (Demo)
-
-Fluxo recomendado para o frontend:
-
-1. Tela Configuracoes chama `POST /api/demo/seed` com payload de seed.
-2. API grava snapshots no MongoDB secundario.
-3. API sincroniza contexto demo no MongoDB principal (`demo_context_links`, `search_jobs` e `insights`).
-4. Tela Dashboard chama `GET /api/dashboard?mode=demo` para montar dados demo.
-5. A consulta de dashboard demo reforca a sincronizacao no banco principal para manter vinculo por `context_id`.
-
-Arquivo de exemplo para payload:
-
-- `examples/demo-seed-payload.example.json`
-
-## Como executar
-
-### API
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-### Worker (terminal separado)
-
-```bash
-python -m apps.worker.app.worker
-```
-
-## Documentacao da API
-
-- Swagger: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-- Healthcheck: `http://localhost:8000/health`
+- `FRONTEND_URL`
+- `OLLAMA_BASE_URL`
+- `OLLAMA_MODEL`
+- `OLLAMA_TIMEOUT_SECONDS`
 
 ## Endpoints principais
 
-Autenticacao:
+- Auth: `/api/auth/*`
+- Ingestao JSON: `POST /api/ingestion/comments`, `GET /api/ingestion/batches`, `GET /api/ingestion/batches/{batch_id}`
+- Importacao para primario: `POST /api/search`
+- Dashboard: `GET /api/dashboard`, `GET /api/mentions`, `GET /api/metrics`
+- Insights: `GET /api/insights`, `POST /api/insights/generate`
+- Chat: `/api/chat/threads/*`
+- Relatorios: `/api/reports*`
 
-- `POST /api/auth/register`
-- `POST /api/auth/login`
-- `POST /api/auth/refresh`
-- `GET /api/auth/me`
+## Deploy (HostingGuru)
 
-Busca e analise:
-
-- `POST /api/search`
-- `POST /api/scrape`
-- `POST /api/analyze`
-- `GET /api/dashboard`
-- `GET /api/mentions`
-- `GET /api/metrics/classification`
-
-Ingestao:
-
-- `POST /api/ingestion/comments`
-- `GET /api/ingestion/batches`
-
-## Testes
-
-Comando recomendado no ambiente atual:
-
-```bash
-py -3.13 -m pytest -q
-```
-
-## Deploy no HostingGuru.io
-
-Para esse repositorio, use o deploy pela raiz (Root Directory vazio).
-
-- Build Command (recomendado):
+- Build Command:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-- Build Command (somente se voce realmente usar coletores com Playwright):
-
-```bash
-pip install -r requirements.txt && python -m playwright install chromium
-```
-
-- Start Command (API + worker juntos no mesmo servico):
+- Start Command (API + worker):
 
 ```bash
 python -m app.hostingguru_start
@@ -171,19 +63,3 @@ python -m app.hostingguru_start
 ```text
 /health
 ```
-
-Observacoes importantes:
-
-- Nao use `cd apps/api`, essa pasta nao existe neste projeto.
-- O script `app.hostingguru_start` sobe a API e inicia o worker no mesmo start command.
-- A porta e lida da variavel `PORT` da plataforma (com fallback para 3000).
-
-## Resumo rapido
-
-Se voce precisa subir o sistema localmente:
-
-1. criar `.env` a partir de `.env.example`
-2. configurar MongoDB
-3. iniciar API
-4. iniciar worker
-5. acessar `/docs` para testar os endpoints

@@ -44,23 +44,6 @@ class DataSource(str, Enum):
     FACEBOOK = "facebook"
 
 
-class ScrapeSource(str, Enum):
-    RECLAMEAQUI = "reclameaqui"
-    REDDIT = "reddit"
-    YOUTUBE = "youtube"
-    APPSTORE = "appstore"
-    PLAYSTORE = "playstore"
-    GLASSDOOR = "glassdoor"
-    TRUSTPILOT = "trustpilot"
-    WEB = "web"
-
-    # Legado/compatibilidade
-    GOOGLE = "google"
-    MASTODON = "mastodon"
-    X = "x"
-    TWITTER = "twitter"
-
-
 # ==================== USER MODELS ====================
 
 class UserBase(BaseModel):
@@ -342,13 +325,11 @@ class MFAVerifyRequest(BaseModel):
 class SearchRequest(BaseModel):
     brand_name: Optional[str] = None
     query: Optional[str] = None
-    sources: List[DataSource] = Field(default_factory=lambda: [DataSource.REDDIT, DataSource.WEB])
-    limit: int = Field(default=5, ge=1, le=50)
-    period_days: int = 30
-    sentiment_filter: Optional[SentimentType] = None
-    locality: Optional[str] = None
-    min_criticality: Optional[CriticalityLevel] = None
-    replace_existing: bool = True
+    sources: List[str] = Field(default_factory=list)
+    limit: int = Field(default=200, ge=1, le=2000)
+    period_days: Optional[int] = Field(default=30, ge=1, le=3650)
+    period_from: Optional[datetime] = None
+    period_to: Optional[datetime] = None
 
     @model_validator(mode="after")
     def normalize_query_alias(self) -> "SearchRequest":
@@ -361,6 +342,16 @@ class SearchRequest(BaseModel):
         if not self.brand_name:
             raise ValueError("brand_name ou query e obrigatorio")
 
+        if self.period_from and self.period_to and self.period_from > self.period_to:
+            raise ValueError("period_from deve ser menor ou igual a period_to")
+
+        normalized_sources: List[str] = []
+        for source in self.sources:
+            value = str(source or "").strip().lower()
+            if value and value not in normalized_sources:
+                normalized_sources.append(value)
+        self.sources = normalized_sources
+
         return self
 
 
@@ -370,16 +361,3 @@ class SearchResponse(BaseModel):
     status: str
     mentions_found: int
     created_at: datetime
-
-
-class ScrapeRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=160)
-    sources: List[ScrapeSource] = Field(default_factory=lambda: [ScrapeSource.RECLAMEAQUI, ScrapeSource.REDDIT, ScrapeSource.WEB])
-    limit_per_source: int = Field(default=5, ge=1, le=10)
-    limit: Optional[int] = Field(default=None, ge=1, le=10)
-
-    @model_validator(mode="after")
-    def normalize_limit_alias(self) -> "ScrapeRequest":
-        if self.limit is not None:
-            self.limit_per_source = int(self.limit)
-        return self

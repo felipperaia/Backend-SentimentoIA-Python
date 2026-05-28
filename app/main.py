@@ -2,7 +2,7 @@
 import hashlib
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -17,15 +17,11 @@ from slowapi.util import get_remote_address
 from app.api.admin_router import router as admin_router
 from app.api.auth_router import router as auth_router
 from app.api.companies_router import router as companies_router
-from app.api.demo_router import router as demo_router
 from app.api.ingestion_router import router as ingestion_router
-from app.api.metrics_router import router as metrics_router
-from app.api.mentions_router import router as mentions_router
-from app.api.reports_router import router as reports_router
 from app.auth_utils import decode_access_token, get_current_user, get_optional_current_user
 from app.config import settings
 from app.database import connect_db, disconnect_db, get_db, get_secondary_db
-from app.models import ScrapeRequest, SearchRequest
+from app.models import SearchRequest
 from app.schemas import (
     ChatMessageCreateRequest,
     ChatThreadCreateRequest,
@@ -34,16 +30,16 @@ from app.schemas import (
     UserSettingsUpdateRequest,
 )
 from app.services.chat_service import ChatService, ChatUnavailableError
+from app.services.company_utils import slugify_company
 from app.services.dashboard_service import DashboardService
 from app.services.enrichment_service import EnrichmentService
+from app.services.ingestion_service import IngestionService
 from app.services.insight_service import InsightGenerationError, InsightService
 from app.services.llm_service import LLMService
 from app.services.normalization_service import normalize_mention, utcnow
 from app.services.nps_service import NpsService
 from app.services.report_service import ReportService
-from app.services.scraper_service import ScraperService
 from app.services.search_service import SearchService
-from app.services.source_registry_service import SourceRegistryService
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -74,7 +70,12 @@ class AnalyzeRequest(BaseModel):
 
 
 class InsightGenerateRequest(BaseModel):
-    batch_id: str | None = None
+    company_id: str | None = None
+    company_slug: str | None = None
+    period_from: datetime | None = None
+    period_to: datetime | None = None
+    period_days: int | None = None
+    filters: dict[str, Any] | None = None
     force: bool = False
 
 
@@ -215,14 +216,14 @@ async def rate_limit_exceeded_handler(request: Request, exc: Exception):
 
 
 async def auto_refresh_loop() -> None:
-    """Auto-refresh desabilitado. Dados vem do Secondary MongoDB via seed."""
+    """Auto-refresh desabilitado no backend atual."""
     return
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
     await connect_db()
-    SourceRegistryService.sync_defaults_to_db()
 
     try:
         await LLMService.validate_connection()
@@ -243,7 +244,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SentimentoIA API",
-    description="Backend com coleta multi-fonte resiliente (Reddit, YouTube, App/Play Store e compatibilidade legada), Ollama Cloud e MongoDB.",
+    description="Backend com ingestao JSON, analise de sentimento, insights e relatorios com MongoDB e LLM.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -282,7 +283,6 @@ async def add_security_headers(request: Request, call_next):
 
 app.include_router(auth_router, prefix="/api/auth", tags=["AutenticaÃ§Ã£o"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
-app.include_router(demo_router, prefix="/api/demo/seed", tags=["Demo"])
 app.include_router(companies_router, prefix="/api", tags=["Empresas"])
 
 
@@ -338,7 +338,6 @@ async def privacy_policy():
 
 
 @app.get("/api/privacy/rights")
-@app.get("/api/lgpd/rights")
 async def privacy_rights():
     return {
         "law": "LGPD",
@@ -513,19 +512,18 @@ async def privacy_export_summary(current_user: dict[str, Any] = Depends(get_curr
 
 @app.get("/api/status/integrations")
 async def integrations_status():
-    """Mostra se as integraÃ§Ãµes principais estÃ£o configuradas."""
+    """Mostra estado das integrações centrais (ingestão JSON + LLM)."""
     llm = await LLMService.healthcheck()
-    active_sources = SourceRegistryService.active_sources()
+    secondary_configured = bool(
+        str(settings.secondary_mongodb_uri or "").strip()
+        and str(settings.secondary_database_name or "").strip()
+    )
     return {
-        "scraping_enabled": True,
-        "scraper_delay_seconds": settings.scraper_request_delay_seconds,
-        "scraper_default_limit": settings.scraper_default_limit,
-        "scraper_default_sources": SourceRegistryService.default_sources(),
-        "scraper_active_sources": active_sources,
-        "scraper_source_metadata": SourceRegistryService.source_metadata(),
-        "mongodb_configured": bool(settings.mongodb_uri),
+        "ingestion_json_enabled": True,
+        "ingestion_staging_collection": IngestionService.STAGING_COLLECTION,
+        "mongodb_primary_configured": bool(settings.mongodb_uri),
+        "mongodb_secondary_configured": secondary_configured,
         "llm": llm,
-        "external_source_apis_removed": True,
     }
 
 
@@ -536,286 +534,204 @@ async def search_mentions(
     payload: SearchRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """
-    Busca dados de mencoes no Secondary MongoDB Atlas.
-    O scrapper foi desativado - dados vem exclusivamente do banco secundario (seed).
-    """
+    """Importa lote filtrado do staging (Mongo secundário) para menções no primário."""
     del request
     user_id = str(current_user.get("_id") or current_user.get("id"))
+
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Banco de dados primario indisponivel")
 
     try:
         secondary_db = get_secondary_db()
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail="Secondary MongoDB nao configurado. Insira dados via Seeds em Configuracoes.",
+            detail="MongoDB secundario de staging nao configurado",
         ) from exc
 
-    collection = secondary_db["demo_dashboard_snapshots"]
-    # Normaliza sempre para lowercase - case insensitive
-    brand_slug = payload.brand_name.strip().lower()
+    now = utcnow()
+    company_name = str(payload.brand_name or "").strip()
+    company_slug = slugify_company(company_name)
+    if not company_slug:
+        raise HTTPException(status_code=400, detail="company_slug invalido")
 
-    query: dict[str, Any] = {"user_id": user_id, "company_slug": brand_slug}
-
-    # Filtro por periodo se informado
-    if payload.period_days:
-        from datetime import timedelta
-        cutoff = datetime.utcnow() - timedelta(days=payload.period_days)
-        query["period_from"] = {"$gte": cutoff}
-
-    snapshots = list(collection.find(query).sort("period_from", -1).limit(1))
-
-    if not snapshots:
-        # Tenta busca parcial (ex: "samsung" encontra "samsung galaxy")
-        query_partial = {
-            "user_id": user_id,
-            "company_slug": {"$regex": f"^{brand_slug}", "$options": "i"},
+    requested_sources = sorted(
+        {
+            str(getattr(source, "value", source)).strip().lower()
+            for source in (payload.sources or [])
+            if str(getattr(source, "value", source)).strip()
         }
-        snapshots = list(collection.find(query_partial).sort("period_from", -1).limit(1))
+    )
 
-    if not snapshots:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Nenhum dado encontrado para '{payload.brand_name}'. Insira dados via Seeds em Configuracoes.",
-        )
+    effective_period_from = payload.period_from
+    effective_period_to = payload.period_to
+    if effective_period_from is None and payload.period_days is not None:
+        effective_period_from = now - timedelta(days=int(payload.period_days))
 
-    latest = snapshots[0]
-    search_id = f"seed_{uuid4().hex}"
-    mentions_raw = latest.get("mentions", []) if isinstance(latest.get("mentions"), list) else []
-    metrics = latest.get("metrics", {}) if isinstance(latest.get("metrics"), dict) else {}
-    company_name = str(latest.get("company_name") or payload.brand_name or "").strip() or payload.brand_name
-    company_slug = str(latest.get("company_slug") or brand_slug).strip().lower() or brand_slug
-    now = datetime.utcnow()
+    staging_query: dict[str, Any] = {
+        "user_id": user_id,
+        "company_slug": company_slug,
+    }
+    if requested_sources:
+        staging_query["source"] = {"$in": requested_sources}
 
-    def _parse_date(value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            candidate = value.strip()
-            if candidate.endswith("Z"):
-                candidate = f"{candidate[:-1]}+00:00"
-            try:
-                return datetime.fromisoformat(candidate)
-            except ValueError:
-                return now
-        return now
+    published_filter: dict[str, Any] = {}
+    if effective_period_from is not None:
+        published_filter["$gte"] = effective_period_from
+    if effective_period_to is not None:
+        published_filter["$lte"] = effective_period_to
+    if published_filter:
+        staging_query["published_at"] = published_filter
 
-    def _normalize_sentiment(value: Any) -> str:
-        raw = str(value or "").strip().lower()
-        if raw in {"positivo", "positive", "pos"}:
-            return "positivo"
-        if raw in {"negativo", "negative", "neg"}:
-            return "negativo"
-        return "neutro"
+    staging_mentions = list(
+        secondary_db[IngestionService.STAGING_COLLECTION]
+        .find(staging_query)
+        .sort("published_at", -1)
+        .limit(int(payload.limit))
+    )
 
-    def _urgency_score(value: Any) -> float:
-        raw = str(value or "").strip().lower()
-        if raw in {"critical", "critica", "crítica"}:
-            return 1.0
-        if raw in {"high", "alta"}:
-            return 0.8
-        if raw in {"medium", "media", "média"}:
-            return 0.5
-        if raw in {"low", "baixa"}:
-            return 0.2
-        try:
-            return max(0.0, min(float(value), 1.0))
-        except (TypeError, ValueError):
-            return 0.5
+    search_id = f"search_{uuid4().hex}"
+    existing_signatures = SearchService._load_existing_signatures(
+        db=db,
+        user_id=user_id,
+        mentions=staging_mentions,
+    )
 
-    def _criticality_from_score(score: float) -> str:
-        if score >= 0.8:
-            return "alta"
-        if score >= 0.5:
-            return "media"
-        return "baixa"
+    imported_mentions: list[dict[str, Any]] = []
+    duplicate_count = 0
 
-    mentions_for_primary: list[dict[str, Any]] = []
-    for item in mentions_raw:
-        if not isinstance(item, dict):
+    for staged in staging_mentions:
+        signature = SearchService._mention_signature(staged)
+        if SearchService._signature_exists(signature, existing_signatures):
+            duplicate_count += 1
             continue
-        text = str(item.get("text") or "").strip()
+
+        text = str(staged.get("text") or "").strip()
         if not text:
             continue
 
-        sentiment = _normalize_sentiment(item.get("sentiment"))
-        score = _urgency_score(item.get("urgency"))
-        aspect = str(item.get("aspect") or "").strip().lower()
-        aspects = [aspect] if aspect else []
-        published_at = _parse_date(item.get("date") or latest.get("period_to"))
+        enrichment = EnrichmentService.analyze_mention(text=text, rating=staged.get("rating"))
+        sentiment = str(enrichment.get("sentiment") or "neutro")
+        aspects = list(enrichment.get("aspects") or [])
+        aspect_sentiment = {str(aspect): sentiment for aspect in aspects if str(aspect).strip()}
 
-        mentions_for_primary.append(
-            {
+        mention_doc = {
+            "user_id": user_id,
+            "search_id": search_id,
+            "query": company_name,
+            "brand_name": company_name,
+            "company_name": str(staged.get("company_name") or company_name),
+            "company_slug": company_slug,
+            "source": str(staged.get("source") or "unknown").strip().lower() or "unknown",
+            "text": text[:5000],
+            "author": str(staged.get("author") or "").strip() or "desconhecido",
+            "published_at": staged.get("published_at") or now,
+            "status": "processed",
+            "external_id": staged.get("external_id"),
+            "source_item_id": staged.get("source_item_id"),
+            "canonical_url": staged.get("canonical_url"),
+            "url": staged.get("url"),
+            "content_hash": staged.get("content_hash"),
+            "text_fingerprint": staged.get("text_fingerprint"),
+            "raw": staged.get("raw"),
+            "raw_payload": staged.get("raw_payload"),
+            "staging_hash": staged.get("staging_hash"),
+            "origin_batch_id": staged.get("batch_id"),
+            **enrichment,
+            "confidence_score": round(float(enrichment.get("confidence", 0.55) or 0.55), 3),
+            "aspect_sentiment": aspect_sentiment,
+            "urgency_factors": [],
+            "summary": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        imported_mentions.append(mention_doc)
+        SearchService._remember_signature(signature, existing_signatures)
+
+    if imported_mentions:
+        db.mentions.insert_many(imported_mentions)
+
+    total_imported = len(imported_mentions)
+    metrics = EnrichmentService.aggregate(imported_mentions) if imported_mentions else EnrichmentService.aggregate([])
+
+    filtros_aplicados = {
+        "user_id": user_id,
+        "company_slug": company_slug,
+        "sources": requested_sources,
+        "period_from": effective_period_from.isoformat() if isinstance(effective_period_from, datetime) else None,
+        "period_to": effective_period_to.isoformat() if isinstance(effective_period_to, datetime) else None,
+        "limit": int(payload.limit),
+    }
+
+    db.search_jobs.update_one(
+        {"user_id": user_id, "search_id": search_id},
+        {
+            "$set": {
                 "search_id": search_id,
                 "user_id": user_id,
                 "query": company_name,
-                "brand_name": company_name,
                 "company_name": company_name,
                 "company_slug": company_slug,
-                "source": str(item.get("source") or "web").strip().lower() or "web",
-                "text": text[:5000],
-                "sentiment": sentiment,
-                "urgency_score": round(score, 4),
-                "criticality": _criticality_from_score(score),
-                "confidence_score": 0.8,
-                "aspects": aspects,
-                "aspect_sentiment": {aspect: sentiment} if aspect else {},
-                "status": "processed",
-                "published_at": published_at,
-                "created_at": now,
+                "status": "completed" if total_imported > 0 else "empty",
+                "total": total_imported,
+                "duplicate_count": duplicate_count,
+                "sources": requested_sources,
+                "period_days": int(payload.period_days or 0),
+                "period_from": effective_period_from,
+                "period_to": effective_period_to,
+                "metrics": metrics,
+                "errors": [],
+                "staging_filters": filtros_aplicados,
                 "updated_at": now,
-            }
-        )
-
-    db = get_db()
-    if db is not None:
-        if payload.replace_existing:
-            db.mentions.delete_many(
-                {
-                    "user_id": user_id,
-                    "company_slug": company_slug,
-                    "search_id": {"$regex": "^seed_"},
-                }
-            )
-        if mentions_for_primary:
-            db.mentions.insert_many(mentions_for_primary)
-
-        db.search_jobs.update_one(
-            {"user_id": user_id, "search_id": search_id},
-            {
-                "$set": {
-                    "search_id": search_id,
-                    "user_id": user_id,
-                    "query": company_name.lower(),
-                    "company_name": company_name,
-                    "company_slug": company_slug,
-                    "period_days": int(payload.period_days or 30),
-                    "locality": payload.locality or "",
-                    "sources": ["secondary_mongodb"],
-                    "status": "completed",
-                    "total": len(mentions_for_primary),
-                    "metrics": metrics,
-                    "errors": [],
-                    "status_summary": {
-                        "status": "success" if mentions_for_primary else "empty",
-                        "partial_success": False,
-                        "sources_requested": 1,
-                        "sources_with_data": 1 if mentions_for_primary else 0,
-                        "sources_failed": 0,
-                        "source_status": [
-                            {
-                                "source": "secondary_mongodb",
-                                "ok": bool(mentions_for_primary),
-                                "count": len(mentions_for_primary),
-                                "error": None,
-                                "reason": None,
-                                "timeout": False,
-                            }
-                        ],
-                    },
-                    "created_at": now,
-                    "updated_at": now,
-                }
             },
-            upsert=True,
-        )
+            "$setOnInsert": {
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
 
-    # Retorna no mesmo formato que o frontend espera do search antigo
     return {
         "search_id": search_id,
-        "brand_name": company_name,
         "company_slug": company_slug,
-        "status": "completed",
-        "mentions": mentions_raw,
-        "metrics": metrics,
-        "insights": latest.get("insights", []),
-        "period_label": latest.get("period_label", ""),
-        "period_from": str(latest.get("period_from", "")),
-        "period_to": str(latest.get("period_to", "")),
-        "source": "secondary_mongodb",
+        "total_importado": total_imported,
+        "duplicados": duplicate_count,
+        "filtros_aplicados": filtros_aplicados,
     }
-
-@app.post("/api/scrape")
-@limiter.limit(f"{settings.rate_limit_scrape_per_minute}/minute")
-async def scrape_mentions(request: Request, payload: ScrapeRequest, current_user: dict[str, Any] = Depends(get_current_user)):
-    """Executa scraping simples por fonte e retorna resultados agrupados."""
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    sources = [getattr(source, "value", str(source)) for source in payload.sources]
-    try:
-        result = await ScraperService.scrape_async(
-            query=payload.query,
-            sources=sources,
-            limit_per_source=payload.limit_per_source,
-            user_id=user_id,
-        )
-        del request
-        return result
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/dashboard")
 async def dashboard(
-    batch_id: str | None = Query(None),
-    search_id: str | None = Query(None),
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
-    mode: str = Query("demo"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
     period_days: int | None = Query(None, ge=1, le=365),
     limit_mentions: int = Query(200, ge=1, le=1000),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Retorna dashboard com snapshots demo do MongoDB secundario."""
-    del batch_id, search_id, mode, period_days, limit_mentions
-
+    """Retorna dashboard consolidado a partir do MongoDB primário."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
+
     try:
-        secondary_db = get_secondary_db()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Secondary MongoDB not configured") from exc
-
-    collection = secondary_db.demo_dashboard_snapshots
-    query: dict[str, Any] = {"user_id": user_id}
-
-    normalized_slug = str(company_slug or company_id or "").strip().lower()
-    if normalized_slug:
-        query["company_slug"] = normalized_slug
-
-    overlap_conditions: list[dict[str, Any]] = []
-    if period_from:
-        overlap_conditions.append({"period_to": {"$gte": period_from}})
-    if period_to:
-        overlap_conditions.append({"period_from": {"$lte": period_to}})
-    if overlap_conditions:
-        query["$and"] = overlap_conditions
-
-    snapshots = list(collection.find(query).sort("period_from", -1))
-    if not snapshots:
-        return {"data": [], "message": "Nenhum dado encontrado para esta empresa."}
-
-    latest = snapshots[0]
-    period_from_value = latest.get("period_from")
-    period_to_value = latest.get("period_to")
-    period_label = f"{period_from_value or ''} - {period_to_value or ''}"
-
-    return {
-        "current_company_name": latest.get("company_name"),
-        "current_company_slug": latest.get("company_slug"),
-        "period_label": period_label,
-        "metrics": latest.get("metrics", {}),
-        "mentions": latest.get("mentions", []),
-        "insights": latest.get("insights", []),
-    }
+        return DashboardService.get_dashboard(
+            user_id=user_id,
+            batch_id=None,
+            period_days=period_days,
+            limit_mentions=limit_mentions,
+            mode="live",
+            company_slug=company_slug or company_id,
+            period_from=period_from,
+            period_to=period_to,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/mentions")
 async def mentions(
-    batch_id: str | None = Query(None),
-    search_id: str | None = Query(None),
-    batch_id_alias: str | None = Query(None, alias="batchId"),
-    search_id_alias: str | None = Query(None, alias="searchId"),
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
@@ -825,22 +741,15 @@ async def mentions(
     limit: str | None = Query("100"),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Lista mencoes por contexto, com filtros opcionais por status e sentimento."""
+    """Lista mencoes por empresa e faixa temporal, com filtros opcionais por status e sentimento."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    selected_batch_id = (
-        str(batch_id or "").strip()
-        or str(search_id or "").strip()
-        or str(batch_id_alias or "").strip()
-        or str(search_id_alias or "").strip()
-        or None
-    )
     normalized_status = str(status or "").strip().lower() or None
     normalized_sentiment = str(sentiment or "").strip().lower() or None
     normalized_limit = _parse_query_int(limit, default=100, minimum=1, maximum=1000)
 
     return DashboardService.list_mentions(
         user_id=user_id,
-        batch_id=selected_batch_id,
+        batch_id=None,
         status=normalized_status,
         sentiment=normalized_sentiment,
         limit=normalized_limit,
@@ -850,9 +759,33 @@ async def mentions(
     )
 
 
+@app.get("/api/metrics")
+async def metrics(
+    company_id: str | None = Query(None, alias="companyId"),
+    company_slug: str | None = Query(None, alias="companySlug"),
+    period_from: datetime | None = Query(None, alias="from"),
+    period_to: datetime | None = Query(None, alias="to"),
+    period_days: int | None = Query(None, ge=1, le=365),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    user_id = str(current_user.get("_id") or current_user.get("id"))
+    try:
+        return DashboardService.aggregate_metrics(
+            user_id=user_id,
+            company_slug=company_slug or company_id,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+            batch_id=None,
+            filters={"scope": "metrics_api"},
+            include_raw=False,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.get("/api/insights")
 async def insights(
-    batch_id: str | None = Query(None),
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
@@ -869,7 +802,7 @@ async def insights(
         user_id=user_id,
         include_archived=include_archived,
         limit=limit,
-        batch_id=batch_id,
+        batch_id=None,
         company_slug=company_slug or company_id,
         period_from=period_from,
         period_to=period_to,
@@ -884,14 +817,18 @@ async def generate_insight(
     payload: InsightGenerateRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Enfileira e processa um insight para batch elegivel, respeitando limiar minimo."""
+    """Gera insight no escopo de empresa/faixa temporal do usuário autenticado."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
 
     try:
         generated = await InsightService.generate_insight(
             user_id=user_id,
-            batch_id=payload.batch_id,
+            company_slug=payload.company_slug or payload.company_id,
+            period_from=payload.period_from,
+            period_to=payload.period_to,
+            period_days=payload.period_days,
             force=payload.force,
+            filters=payload.filters,
         )
         return {"ok": True, "item": generated}
     except InsightGenerationError as exc:
@@ -918,6 +855,8 @@ async def generate_insight(
                 "meta": details,
             },
         )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1118,7 +1057,10 @@ async def analyze(
         raise HTTPException(status_code=400, detail="Texto nÃ£o pode estar vazio")
 
     enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
-    llm_analysis = await LLMService.analyze_single_mention(mention["text"])
+    try:
+        llm_analysis = await LLMService.analyze_single_mention(mention["text"])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     merged_aspects = list(enrichment.get("aspects") or [])
     for aspect in (llm_analysis.get("aspect_sentiment") or {}).keys():
@@ -1203,207 +1145,117 @@ async def list_reports(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@app.get("/api/reports/export")
-async def export_filtered_report(
-    report_format: str = Query("csv", alias="format"),
+@app.get("/api/reports/export/mentions.csv")
+async def export_reports_mentions_csv(
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
+    period_days: int | None = Query(None, ge=1, le=365),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exporta relatÃ³rios por filtro de empresa/perÃ­odo (CSV ou PDF)."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
-        return ReportService.export_filtered(
+        return ReportService.export_mentions_csv_canonical(
             user_id=user_id,
-            report_format=report_format,
             company_id=company_id,
             company_slug=company_slug,
             period_from=period_from,
             period_to=period_to,
+            period_days=period_days,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         detail = str(exc)
-        status_code = 404 if "nenhum" in detail.lower() else 400
+        status_code = 404 if "nenhuma" in detail.lower() else 400
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
-@app.get("/api/reports/csv")
-async def export_csv(
-    search_id: str,
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
-    """Exporta CSV real filtrado pelo search_id."""
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    return ReportService.export_csv(user_id, search_id)
-
-
-@app.get("/api/reports/pdf")
-async def export_pdf(
-    search_id: str,
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
-    """Exporta PDF executivo profissional filtrado pelo search_id."""
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    return ReportService.export_pdf(user_id, search_id)
-
-
-@app.get("/api/reports/export/{report_format}")
-async def export_latest_report(
-    report_format: str,
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
-    """Compatibilidade com o frontend: exporta CSV/PDF da Ãºltima busca concluÃ­da."""
-    db = get_db()
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    last = db.search_jobs.find_one({"user_id": user_id, "status": "completed"}, sort=[("created_at", -1)])
-    if not last:
-        raise HTTPException(status_code=404, detail="Nenhuma busca concluÃ­da para exportar")
-
-    search_id = last["search_id"]
-    if report_format == "csv":
-        return ReportService.export_csv(user_id, search_id)
-    if report_format == "pdf":
-        return ReportService.export_pdf(user_id, search_id)
-
-    raise HTTPException(status_code=400, detail="Formato invÃ¡lido. Use csv ou pdf")
-
-
-@app.get("/api/insights/export/markdown")
-async def export_insights_markdown(
-    priority: str | None = Query(None),
-    resolution: str | None = Query(None),
+@app.get("/api/reports/export/dashboard.pdf")
+async def export_reports_dashboard_pdf(
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
-    limit: int = Query(100, ge=1, le=500),
+    period_days: int | None = Query(None, ge=1, le=365),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exporta insights filtrados em Markdown."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    return ReportService.export_insights_markdown(
-        user_id=user_id,
-        priority=priority,
-        resolution=resolution,
-        company_slug=company_slug or company_id,
-        period_from=period_from,
-        period_to=period_to,
-        limit=limit,
-    )
+    try:
+        return ReportService.export_dashboard_pdf_canonical(
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "nenhuma" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
-@app.get("/api/insights/export/csv")
-async def export_insights_csv(
-    priority: str | None = Query(None),
-    resolution: str | None = Query(None),
+@app.get("/api/reports/export/insights.pdf")
+async def export_reports_insights_pdf(
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
-    limit: int = Query(100, ge=1, le=500),
+    period_days: int | None = Query(None, ge=1, le=365),
+    limit: int = Query(300, ge=1, le=500),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exporta insights filtrados em CSV."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    return ReportService.export_insights_csv(
-        user_id=user_id,
-        priority=priority,
-        resolution=resolution,
-        company_slug=company_slug or company_id,
-        period_from=period_from,
-        period_to=period_to,
-        limit=limit,
-    )
+    try:
+        return ReportService.export_insights_pdf_canonical(
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+            limit=limit,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "nenhuma" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
-@app.get("/api/insights/export/pdf")
-async def export_insights_pdf(
-    priority: str | None = Query(None),
-    resolution: str | None = Query(None),
+@app.get("/api/reports/export/metrics.pdf")
+async def export_reports_metrics_pdf(
     company_id: str | None = Query(None, alias="companyId"),
     company_slug: str | None = Query(None, alias="companySlug"),
     period_from: datetime | None = Query(None, alias="from"),
     period_to: datetime | None = Query(None, alias="to"),
-    limit: int = Query(100, ge=1, le=500),
+    period_days: int | None = Query(None, ge=1, le=365),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exporta insights filtrados em PDF executivo."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
-    return ReportService.export_insights_pdf(
-        user_id=user_id,
-        priority=priority,
-        resolution=resolution,
-        company_slug=company_slug or company_id,
-        period_from=period_from,
-        period_to=period_to,
-        limit=limit,
-    )
+    try:
+        return ReportService.export_metrics_pdf_canonical(
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "nenhuma" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
-
-@app.delete("/api/dev/clear-data")
-async def clear_data(current_user: dict[str, Any] = Depends(get_current_user)):
-    """Limpa dados do usuÃ¡rio logado.
-
-    Uso apenas em desenvolvimento/testes.
-    """
-    db = get_db()
-    if db is None:
-        raise HTTPException(status_code=503, detail="Banco de dados indisponivel")
-
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    collections = [
-        "mentions",
-        "search_jobs",
-        "alerts",
-        "reports",
-        "insight_jobs",
-        "insights",
-        "chat_messages",
-        "chat_threads",
-        "comment_batches",
-        "nps_responses",
-        "privacyconsents",
-        "user_consents",
-    ]
-    for collection_name in collections:
-        collection = getattr(db, collection_name)
-        collection.delete_many({"user_id": user_id})
-    db.dashboard_settings.delete_many({"user_id": user_id})
-    return {"ok": True, "message": "Dados do usuÃ¡rio removidos"}
 
 # ==================== DATA MANAGEMENT (DELETE) ====================
-
-@app.delete("/api/conversations/{id}")
-async def delete_conversation(id: str, current_user: dict[str, Any] = Depends(get_current_user)):
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    try:
-        deleted = ChatService.delete_thread(user_id=user_id, thread_id=id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Conversa nÃ£o encontrada")
-    return {"ok": True}
-
-@app.delete("/api/conversations/{id}/messages/{msg_id}")
-async def delete_message(id: str, msg_id: str, current_user: dict[str, Any] = Depends(get_current_user)):
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    try:
-        deleted = ChatService.delete_message(user_id=user_id, thread_id=id, message_id=msg_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Mensagem nÃ£o encontrada")
-    return {"ok": True}
-
-@app.delete("/api/conversations/all")
-async def delete_all_conversations(current_user: dict[str, Any] = Depends(get_current_user)):
-    user_id = str(current_user.get("_id") or current_user.get("id"))
-    result = ChatService.delete_all_threads(user_id=user_id)
-    return {"ok": True, **result}
 
 @app.delete("/api/searches/{id}")
 async def delete_search(id: str, current_user: dict[str, Any] = Depends(get_current_user)):
@@ -1431,7 +1283,6 @@ async def delete_all_insights(current_user: dict[str, Any] = Depends(get_current
     return {"ok": True}
 
 @app.delete("/api/user/data/all")
-@app.delete("/api/user-data/all")
 async def delete_all_user_data(
     request: Request,
     current_user: dict[str, Any] = Depends(get_current_user),
@@ -1441,11 +1292,20 @@ async def delete_all_user_data(
     collections = [
         "mentions", "search_jobs", "alerts", "reports", "insight_jobs", 
         "insights", "chat_messages", "chat_threads", "comment_batches", 
-        "nps_responses", "scraped_items", "scrape_cache", "privacyconsents", "user_consents"
+        "nps_responses", "privacyconsents", "user_consents"
     ]
     for coll in collections:
         db[coll].delete_many({"user_id": user_id})
     db.dashboard_settings.delete_many({"user_id": user_id})
+
+    secondary_deleted: dict[str, int] = {}
+    try:
+        secondary_db = get_secondary_db()
+        for coll in [IngestionService.STAGING_COLLECTION, IngestionService.BATCH_COLLECTION]:
+            result = secondary_db[coll].delete_many({"user_id": user_id})
+            secondary_deleted[coll] = int(result.deleted_count)
+    except RuntimeError:
+        secondary_deleted = {}
 
     db.audit_logs.insert_one(
         {
@@ -1456,7 +1316,11 @@ async def delete_all_user_data(
         }
     )
 
-    return {"ok": True, "message": "Todos os dados do usuÃ¡rio foram apagados com sucesso"}
+    return {
+        "ok": True,
+        "message": "Todos os dados do usuÃ¡rio foram apagados com sucesso",
+        "secondary_deleted": secondary_deleted,
+    }
 
 
 # ==================== NPS ====================
@@ -1519,9 +1383,6 @@ async def nps_metrics(
     return NpsService.get_metrics(period_days=period_days, module_key=module_key)
 
 
-# Routers adicionais para compatibilidade com endpoints especializados.
-app.include_router(mentions_router, prefix="/api/mentions")
-app.include_router(metrics_router, prefix="/api/metrics", tags=["MÃ©tricas"])
-app.include_router(reports_router, prefix="/api/reports-admin")
+# Router adicional de administração.
 app.include_router(admin_router, prefix="/api/admin")
 

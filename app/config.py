@@ -41,23 +41,6 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
     ollama_timeout_seconds: int = 120
 
-    # Scraper
-    scraper_timeout_seconds: int = 30
-    scraper_retry_attempts: int = 2
-    scraper_retry_backoff_seconds: float = 2.0
-    scraper_request_delay_seconds: float = 1.0
-    scraper_min_text_length: int = 20
-    scraper_default_limit: int = 10
-    scraper_max_items_per_source: int = 20
-    scraper_max_total_items: int = 100
-
-    # Features
-    enable_reclame_aqui: bool = True
-    enable_playwright: bool = False
-
-    # Cache
-    cache_ttl_minutes: int = 60
-
     # Email
     smtp_host: str = ""
     smtp_port: int = 587
@@ -88,7 +71,6 @@ class Settings(BaseSettings):
 
     # Rate limiting (requests per minute)
     rate_limit_search_per_minute: int = 5
-    rate_limit_scrape_per_minute: int = 3
     rate_limit_analyze_per_minute: int = 10
 
     # NPS
@@ -104,24 +86,17 @@ class Settings(BaseSettings):
     privacy_contact_email: str = ""
 
     # Auto refresh
-    AUTO_REFRESH_ENABLED: bool = False
     auto_refresh_enabled: bool = False
-    auto_refresh_interval_minutes: int = 60
 
     _LEGACY_MAP: ClassVar[dict[str, str]] = {
         "ACCESS_TOKEN_EXPIRE_MINUTES": "access_token_expire_minutes",
         "ALGORITHM": "algorithm",
         "AUTO_REFRESH_ENABLED": "auto_refresh_enabled",
-        "AUTO_REFRESH_INTERVAL_MINUTES": "auto_refresh_interval_minutes",
         "BATCH_SIZE": "batch_size",
-        "CACHE_TTL_MINUTES": "cache_ttl_minutes",
         "CORS_ORIGINS": "cors_origins",
         "CORS_ORIGINS_CSV": "cors_origins_csv",
         "DATA_RETENTION_YEARS": "data_retention_years",
         "DATABASE_NAME": "database_name",
-        "ENABLE_PLAYWRIGHT": "enable_playwright",
-        "ENABLE_RECLAMEAQUI": "enable_reclame_aqui",
-        "ENABLE_RECLAME_AQUI": "enable_reclame_aqui",
         "FRONTEND_URL": "frontend_url",
         "LLM_MAX_SAMPLE_MENTIONS": "llm_max_sample_mentions",
         "LLM_MODEL_EFFECTIVE": "ollama_model",
@@ -138,18 +113,8 @@ class Settings(BaseSettings):
         "OLLAMA_TIMEOUT_SECONDS": "ollama_timeout_seconds",
         "PRIVACY_CONTACT_EMAIL": "privacy_contact_email",
         "RATE_LIMIT_ANALYZE_PER_MINUTE": "rate_limit_analyze_per_minute",
-        "RATE_LIMIT_SCRAPE_PER_MINUTE": "rate_limit_scrape_per_minute",
         "RATE_LIMIT_SEARCH_PER_MINUTE": "rate_limit_search_per_minute",
         "REFRESH_TOKEN_EXPIRE_DAYS": "refresh_token_expire_days",
-        "SCRAPER_DEFAULT_LIMIT": "scraper_default_limit",
-        "SCRAPER_DELAY_SECONDS": "scraper_request_delay_seconds",
-        "SCRAPER_MAX_ITEMS_PER_SOURCE": "scraper_max_items_per_source",
-        "SCRAPER_MAX_TOTAL_ITEMS": "scraper_max_total_items",
-        "SCRAPER_MIN_TEXT_LENGTH": "scraper_min_text_length",
-        "SCRAPER_REQUEST_DELAY_SECONDS": "scraper_request_delay_seconds",
-        "SCRAPER_RETRY_ATTEMPTS": "scraper_retry_attempts",
-        "SCRAPER_RETRY_BACKOFF_SECONDS": "scraper_retry_backoff_seconds",
-        "SCRAPER_TIMEOUT_SECONDS": "scraper_timeout_seconds",
         "SECONDARY_DATABASE_NAME": "secondary_database_name",
         "SECONDARY_MONGODB_URI": "secondary_mongodb_uri",
         "SECRET_KEY": "secret_key",
