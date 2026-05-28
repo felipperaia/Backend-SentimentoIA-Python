@@ -482,7 +482,7 @@ class LLMService:
     @staticmethod
     async def analyze_mentions(brand: str, mentions: list[dict[str, Any]]) -> dict[str, Any]:
         if not mentions:
-            return LLMService.empty_analysis("Sem mencoes coletadas para analise.")
+            return LLMService.empty_analysis("Sem mencoes importadas para analise.")
 
         sentiments: dict[str, int] = {}
         for mention in mentions:

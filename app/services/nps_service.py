@@ -110,7 +110,7 @@ class NpsService:
 
     @staticmethod
     def should_show_nps(user_id: str | None, session_id: str) -> dict[str, Any]:
-        """Mostra NPS apenas em trigger pos-busca, com cooldown e sessao inedita."""
+        """Mostra NPS de experiência da plataforma com cooldown e sessão inédita."""
         result: dict[str, Any] = {"should_show": False, "trigger": None}
 
         if not settings.NPS_ENABLED:
@@ -129,38 +129,15 @@ class NpsService:
         if db.nps_responses.find_one(session_query):
             return result
 
-        recent_search_cutoff = utcnow() - timedelta(hours=24)
-        search_query: dict[str, Any] = {
-            "status": "completed",
-            "$or": [
-                {"updated_at": {"$gte": recent_search_cutoff}},
-                {"created_at": {"$gte": recent_search_cutoff}},
-            ],
-        }
-        if user_id:
-            search_query["user_id"] = user_id
-
-        search_doc = db.search_jobs.find_one(search_query, sort=[("updated_at", -1), ("created_at", -1)])
-        if not search_doc:
-            return result
-
         history_query: dict[str, Any] = {"user_id": user_id} if user_id else {"session_id": {"$ne": session_id}}
         last_response = db.nps_responses.find_one(history_query, sort=[("created_at", -1)])
-        search_timestamp = search_doc.get("updated_at") or search_doc.get("created_at")
         last_created_at = last_response.get("created_at") if isinstance(last_response, dict) else None
 
         cooldown_cutoff = utcnow() - timedelta(days=max(1, int(settings.NPS_COOLDOWN_DAYS or 7)))
         if isinstance(last_created_at, datetime) and last_created_at > cooldown_cutoff:
             return result
 
-        if isinstance(last_created_at, datetime) and isinstance(search_timestamp, datetime):
-            if search_timestamp <= last_created_at:
-                return result
-
-        if isinstance(search_timestamp, datetime) and search_timestamp < recent_search_cutoff:
-            return result
-
-        return {"should_show": True, "trigger": "post_search"}
+        return {"should_show": True, "trigger": "platform_experience"}
 
     @staticmethod
     def get_metrics(

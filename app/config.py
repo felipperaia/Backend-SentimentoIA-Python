@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # NPS
     nps_enabled: bool = True
     nps_cooldown_days: int = 30
-    nps_min_interactions: int = 5
+    nps_min_interactions: int = 0
 
     # Logs
     log_level: str = "INFO"

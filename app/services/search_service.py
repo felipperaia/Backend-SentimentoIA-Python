@@ -26,7 +26,7 @@ class SearchService:
         text = str(message or "").strip()
         lowered = text.lower()
         if not text:
-            return "Falha temporaria na coleta"
+            return "Falha temporaria no processamento"
 
         # Nunca expor detalhes internos de stack/upstream/model/gateway.
         blocked_markers = [
@@ -41,12 +41,12 @@ class SearchService:
             "model",
         ]
         if any(marker in lowered for marker in blocked_markers):
-            return "Falha temporaria na coleta"
+            return "Falha temporaria no processamento"
 
         if "timeout" in lowered or "timed out" in lowered:
-            return "Tempo limite excedido na coleta"
+            return "Tempo limite excedido no processamento"
         if "429" in lowered or "rate limit" in lowered or "limite" in lowered:
-            return "Limite temporario da fonte atingido"
+            return "Limite temporario do processamento atingido"
 
         return text[:220]
 
@@ -59,7 +59,7 @@ class SearchService:
             timeout = bool(entry.get("timeout", False)) or reason == "timeout"
 
             if timeout:
-                message = "Tempo limite excedido na coleta"
+                message = "Tempo limite excedido no processamento"
             if not reason:
                 if timeout:
                     reason = "timeout"
@@ -146,16 +146,16 @@ class SearchService:
 
         if partial_success:
             status = "partial_success"
-            message = "Coleta concluida com falhas parciais em algumas fontes."
+            message = "Importacao concluida com falhas parciais em algumas fontes."
         elif sources_with_data == 0 and sources_failed > 0:
             status = "failed"
-            message = "Coleta sem resultados devido a falhas nas fontes selecionadas."
+            message = "Importacao sem resultados devido a falhas nas fontes selecionadas."
         elif sources_with_data == 0:
             status = "empty"
-            message = "Coleta concluida sem novos resultados."
+            message = "Importacao concluida sem novos resultados."
         else:
             status = "success"
-            message = "Coleta concluida com sucesso."
+            message = "Importacao concluida com sucesso."
 
         if timeout_sources and status in {"partial_success", "failed"}:
             message = f"{message} Uma ou mais fontes atingiram tempo limite."
@@ -184,7 +184,7 @@ class SearchService:
     ) -> dict[str, Any]:
         del user_id, query, sources, period_days, locality, use_cache
         raise RuntimeError(
-            "Fluxo de coleta por scraping foi removido. Use /api/ingestion/comments para staging JSON e /api/search para importar ao primario."
+            "Fluxo externo de scraping foi removido. Use /api/ingestion/comments para staging JSON e /api/search para importar do secundario ao primario."
         )
 
     @staticmethod
