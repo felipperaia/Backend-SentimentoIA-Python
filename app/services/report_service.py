@@ -64,6 +64,15 @@ class ReportService:
         }
 
     @staticmethod
+    def _require_reportlab_components() -> dict[str, Any]:
+        reportlab = ReportService._load_reportlab_components()
+        if reportlab is None:
+            raise RuntimeError(
+                "Exportacao PDF indisponivel no momento. Verifique a dependencia reportlab no backend."
+            )
+        return reportlab
+
+    @staticmethod
     def _load_mentions(db, user_id: str, search_id: str) -> list[dict[str, Any]]:
         """Carrega mencoes por search_id OU batch_id."""
         mentions = list(
@@ -1104,6 +1113,8 @@ class ReportService:
         if not mentions:
             raise ValueError("Nenhuma mencao encontrada para o filtro informado")
 
+        ReportService._require_reportlab_components()
+
         file_label = ReportService._report_file_label(
             prefix="dashboard",
             company_slug=normalized_company_slug,
@@ -1139,13 +1150,24 @@ class ReportService:
         ):
             raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
 
-        return ReportService.export_insights_pdf(
+        ReportService._require_reportlab_components()
+
+        response = ReportService.export_insights_pdf(
             user_id=user_id,
             company_slug=normalized_company_slug,
             period_from=effective_period_from,
             period_to=effective_period_to,
             limit=max(1, min(int(limit), 500)),
         )
+
+        file_label = ReportService._report_file_label(
+            prefix="insights",
+            company_slug=normalized_company_slug,
+            period_from=effective_period_from,
+            period_to=effective_period_to,
+        )
+        response.headers["Content-Disposition"] = f'attachment; filename="{file_label}.pdf"'
+        return response
 
     @staticmethod
     def export_metrics_pdf_canonical(
@@ -1182,13 +1204,7 @@ class ReportService:
             include_raw=False,
         )
 
-        reportlab = ReportService._load_reportlab_components()
-        if reportlab is None:
-            return Response(
-                content="Exportacao PDF indisponivel neste ambiente (dependencia reportlab ausente).",
-                media_type="text/plain",
-                status_code=503,
-            )
+        reportlab = ReportService._require_reportlab_components()
 
         colors = reportlab["colors"]
         A4 = reportlab["A4"]

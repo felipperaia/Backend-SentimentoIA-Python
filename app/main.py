@@ -3,6 +3,7 @@ import hashlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -170,6 +171,46 @@ def _parse_query_int(value: Any, *, default: int, minimum: int, maximum: int) ->
         return default
 
     return max(minimum, min(maximum, parsed))
+
+
+def _datetime_to_iso(value: datetime | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
+
+
+def _log_report_export_event(
+    *,
+    endpoint: str,
+    result: str,
+    status_code: int,
+    user_id: str,
+    company_id: str | None,
+    company_slug: str | None,
+    period_from: datetime | None,
+    period_to: datetime | None,
+    duration_ms: int,
+    extra: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "endpoint": endpoint,
+        "result": result,
+        "status_code": status_code,
+        "user_id": user_id,
+        "company_id": company_id,
+        "company_slug": company_slug,
+        "period_from": _datetime_to_iso(period_from),
+        "period_to": _datetime_to_iso(period_to),
+        "duration_ms": max(0, int(duration_ms)),
+    }
+    if extra:
+        payload.update(extra)
+    if error:
+        payload["error"] = error
+
+    log_method = logger.info if result == "success" else logger.warning
+    log_method("report_export %s", payload)
 
 
 def _hash_ip_prefix(ip_address: str | None) -> str:
@@ -1220,8 +1261,9 @@ async def export_reports_mentions_csv(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     user_id = str(current_user.get("_id") or current_user.get("id"))
+    started_at = perf_counter()
     try:
-        return ReportService.export_mentions_csv_canonical(
+        response = ReportService.export_mentions_csv_canonical(
             user_id=user_id,
             company_id=company_id,
             company_slug=company_slug,
@@ -1229,11 +1271,51 @@ async def export_reports_mentions_csv(
             period_to=period_to,
             period_days=period_days,
         )
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        _log_report_export_event(
+            endpoint="/api/reports/export/mentions.csv",
+            result="success",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+        )
+        return response
     except RuntimeError as exc:
+        _log_report_export_event(
+            endpoint="/api/reports/export/mentions.csv",
+            result="error",
+            status_code=503,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+            error=str(exc),
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "nenhuma" in detail.lower() else 400
+        _log_report_export_event(
+            endpoint="/api/reports/export/mentions.csv",
+            result="error",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+            error=detail,
+        )
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
@@ -1247,8 +1329,9 @@ async def export_reports_dashboard_pdf(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     user_id = str(current_user.get("_id") or current_user.get("id"))
+    started_at = perf_counter()
     try:
-        return ReportService.export_dashboard_pdf_canonical(
+        response = ReportService.export_dashboard_pdf_canonical(
             user_id=user_id,
             company_id=company_id,
             company_slug=company_slug,
@@ -1256,11 +1339,51 @@ async def export_reports_dashboard_pdf(
             period_to=period_to,
             period_days=period_days,
         )
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        _log_report_export_event(
+            endpoint="/api/reports/export/dashboard.pdf",
+            result="success",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+        )
+        return response
     except RuntimeError as exc:
+        _log_report_export_event(
+            endpoint="/api/reports/export/dashboard.pdf",
+            result="error",
+            status_code=503,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+            error=str(exc),
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "nenhuma" in detail.lower() else 400
+        _log_report_export_event(
+            endpoint="/api/reports/export/dashboard.pdf",
+            result="error",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+            error=detail,
+        )
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
@@ -1275,8 +1398,9 @@ async def export_reports_insights_pdf(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     user_id = str(current_user.get("_id") or current_user.get("id"))
+    started_at = perf_counter()
     try:
-        return ReportService.export_insights_pdf_canonical(
+        response = ReportService.export_insights_pdf_canonical(
             user_id=user_id,
             company_id=company_id,
             company_slug=company_slug,
@@ -1285,11 +1409,51 @@ async def export_reports_insights_pdf(
             period_days=period_days,
             limit=limit,
         )
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        _log_report_export_event(
+            endpoint="/api/reports/export/insights.pdf",
+            result="success",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days, "limit": limit},
+        )
+        return response
     except RuntimeError as exc:
+        _log_report_export_event(
+            endpoint="/api/reports/export/insights.pdf",
+            result="error",
+            status_code=503,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days, "limit": limit},
+            error=str(exc),
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "nenhuma" in detail.lower() else 400
+        _log_report_export_event(
+            endpoint="/api/reports/export/insights.pdf",
+            result="error",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days, "limit": limit},
+            error=detail,
+        )
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
@@ -1303,8 +1467,9 @@ async def export_reports_metrics_pdf(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     user_id = str(current_user.get("_id") or current_user.get("id"))
+    started_at = perf_counter()
     try:
-        return ReportService.export_metrics_pdf_canonical(
+        response = ReportService.export_metrics_pdf_canonical(
             user_id=user_id,
             company_id=company_id,
             company_slug=company_slug,
@@ -1312,11 +1477,51 @@ async def export_reports_metrics_pdf(
             period_to=period_to,
             period_days=period_days,
         )
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        _log_report_export_event(
+            endpoint="/api/reports/export/metrics.pdf",
+            result="success",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+        )
+        return response
     except RuntimeError as exc:
+        _log_report_export_event(
+            endpoint="/api/reports/export/metrics.pdf",
+            result="error",
+            status_code=503,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+            error=str(exc),
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "nenhuma" in detail.lower() else 400
+        _log_report_export_event(
+            endpoint="/api/reports/export/metrics.pdf",
+            result="error",
+            status_code=status_code,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            duration_ms=int((perf_counter() - started_at) * 1000),
+            extra={"period_days": period_days},
+            error=detail,
+        )
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
