@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
+from datetime import timezone
 
 from app.config import settings
 from app.database import get_db
@@ -131,10 +132,11 @@ class NpsService:
 
         history_query: dict[str, Any] = {"user_id": user_id} if user_id else {"session_id": {"$ne": session_id}}
         last_response = db.nps_responses.find_one(history_query, sort=[("created_at", -1)])
-        last_created_at = last_response.get("created_at") if isinstance(last_response, dict) else None
+        last_created_at_raw = last_response.get("created_at") if isinstance(last_response, dict) else None
+        last_created_at = NpsService._coerce_datetime(last_created_at_raw)
 
         cooldown_cutoff = utcnow() - timedelta(days=max(1, int(settings.NPS_COOLDOWN_DAYS or 7)))
-        if isinstance(last_created_at, datetime) and last_created_at > cooldown_cutoff:
+        if last_created_at is not None and last_created_at > cooldown_cutoff:
             return result
 
         return {"should_show": True, "trigger": "platform_experience"}
@@ -196,6 +198,7 @@ class NpsService:
             data["nps_score"] = round(((data["promoters"] - data["detractors"]) / t) * 100, 1) if t else 0
 
         # Comentários recentes
+        min_datetime_utc = datetime.min.replace(tzinfo=timezone.utc)
         recent = [
             {
                 "comment": r.get("comment"),
@@ -203,7 +206,11 @@ class NpsService:
                 "module_key": r.get("module_key"),
                 "created_at": r.get("created_at").isoformat() if hasattr(r.get("created_at"), "isoformat") else r.get("created_at"),
             }
-            for r in sorted(responses, key=lambda x: x.get("created_at", ""), reverse=True)[:10]
+            for r in sorted(
+                responses,
+                key=lambda x: NpsService._coerce_datetime(x.get("created_at")) or min_datetime_utc,
+                reverse=True,
+            )[:10]
             if r.get("comment")
         ]
 
@@ -217,3 +224,24 @@ class NpsService:
             "by_module": by_module,
             "recent_comments": recent,
         }
+    @staticmethod
+    def _coerce_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            normalized = raw.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed
+
+        return None

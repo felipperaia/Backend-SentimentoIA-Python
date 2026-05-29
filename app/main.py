@@ -262,7 +262,19 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_id = uuid4().hex
+        logger.exception("Erro nao tratado request_id=%s path=%s", request_id, request.url.path)
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": "Erro interno. Tente novamente em instantes.",
+                "request_id": request_id,
+            },
+        )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
@@ -1419,10 +1431,10 @@ async def nps_dismiss(
 @app.get("/api/nps/check")
 async def nps_check(
     session_id: str = Query(...),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] | None = Depends(get_optional_current_user),
 ):
     """Verifica se deve mostrar NPS ao usuario."""
-    user_id = str(current_user.get("_id") or current_user.get("id"))
+    user_id = str(current_user.get("_id") or current_user.get("id")) if current_user else None
     return NpsService.should_show_nps(user_id=user_id, session_id=session_id)
 
 

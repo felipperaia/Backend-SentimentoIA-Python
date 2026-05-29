@@ -347,7 +347,7 @@ async def forgot_password(payload: PasswordReset, request: Request):
 
     return PasswordResetResponse(
         status="success",
-        message="E-mail enviado com sucesso. Se o endereco estiver cadastrado, voce recebera um link de recuperacao.",
+        message="Se o endereco estiver cadastrado, voce recebera um link de recuperacao.",
     )
 
 

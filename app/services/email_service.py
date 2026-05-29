@@ -94,4 +94,6 @@ class EmailService:
                 server.ehlo()
             if username and password:
                 server.login(username, password)
-            server.send_message(msg)
+            send_result = server.send_message(msg)
+            if send_result:
+                raise smtplib.SMTPRecipientsRefused(send_result)
