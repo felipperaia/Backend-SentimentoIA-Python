@@ -228,7 +228,7 @@ async def lifespan(app: FastAPI):
     try:
         await LLMService.validate_connection()
     except Exception as exc:
-        logger.warning(f"Ollama nÃ£o acessÃ­vel. Funcionalidades de IA desabilitadas: {exc}")
+        logger.warning(f"Ollama não acessível. Funcionalidades de IA desabilitadas: {exc}")
 
     task = None
     if settings.auto_refresh_enabled:
@@ -281,7 +281,7 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-app.include_router(auth_router, prefix="/api/auth", tags=["AutenticaÃ§Ã£o"])
+app.include_router(auth_router, prefix="/api/auth", tags=["Autenticação"])
 app.include_router(ingestion_router, prefix="/api/ingestion", tags=["Ingestao"])
 app.include_router(companies_router, prefix="/api", tags=["Empresas"])
 
@@ -301,7 +301,7 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Evita que exceÃ§Ãµes inesperadas virem resposta HTML quebrada no frontend."""
+    """Evita que exceções inesperadas virem resposta HTML quebrada no frontend."""
     request_id = uuid4().hex
     logger.exception("Erro nao tratado request_id=%s path=%s", request_id, request.url.path)
 
@@ -317,7 +317,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 async def health():
-    """Healthcheck simples para saber se o backend estÃ¡ ativo."""
+    """Healthcheck simples para saber se o backend está ativo."""
     return {"status": "ok", "version": "1.0.0"}
 
 
@@ -328,9 +328,9 @@ async def privacy_policy():
         "effective_date": "2024-01-01",
         "lgpd_compliant": True,
         "data_controller": "SentimentoIA",
-        "data_subject_rights": ["acesso", "retificaÃ§Ã£o", "exclusÃ£o", "portabilidade", "revogaÃ§Ã£o"],
+        "data_subject_rights": ["acesso", "retificação", "exclusão", "portabilidade", "revogação"],
         "retention_policy": (
-            "Dados mantidos atÃ© exclusÃ£o pelo usuÃ¡rio ou "
+            "Dados mantidos até exclusão pelo usuário ou "
             f"{max(1, int(settings.DATA_RETENTION_YEARS))} anos de inatividade."
         ),
         "contact": settings.PRIVACY_CONTACT_EMAIL or "privacidade@sentimentoia.com",
@@ -367,7 +367,7 @@ async def privacy_consent(
 
     user_id = str(current_user.get("_id") or current_user.get("id")) if current_user else None
     if not user_id and not payload.session_id:
-        raise HTTPException(status_code=400, detail="Informe session_id quando nÃ£o autenticado")
+        raise HTTPException(status_code=400, detail="Informe session_id quando não autenticado")
 
     preferences = payload.normalized_preferences()
     consent = payload.resolved_consent()
@@ -436,7 +436,7 @@ async def get_privacy_consent(
     elif session_id:
         query = {"session_id": session_id}
     else:
-        raise HTTPException(status_code=400, detail="Informe session_id quando nÃ£o autenticado")
+        raise HTTPException(status_code=400, detail="Informe session_id quando não autenticado")
 
     doc = db.privacyconsents.find_one(query, sort=[("updated_at", -1), ("created_at", -1)])
     if not doc:
@@ -1018,7 +1018,7 @@ async def delete_chat_thread(
     thread_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exclui uma thread de chat e todas as suas mensagens (escopo do usuÃ¡rio)."""
+    """Exclui uma thread de chat e todas as suas mensagens (escopo do usuário)."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         deleted = ChatService.delete_thread(user_id=user_id, thread_id=thread_id)
@@ -1035,7 +1035,7 @@ async def delete_chat_thread_message(
     message_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exclui uma mensagem da thread do usuÃ¡rio."""
+    """Exclui uma mensagem da thread do usuário."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         deleted = ChatService.delete_message(user_id=user_id, thread_id=thread_id, message_id=message_id)
@@ -1050,7 +1050,7 @@ async def delete_chat_thread_message(
 async def delete_all_chat_threads(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Exclui todas as threads e mensagens de chat do usuÃ¡rio autenticado."""
+    """Exclui todas as threads e mensagens de chat do usuário autenticado."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     result = ChatService.delete_all_threads(user_id=user_id)
     return {"ok": True, **result}
@@ -1088,16 +1088,16 @@ async def analyze(
     payload: AnalyzeRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Analisa um texto manualmente e salva como menÃ§Ã£o do usuÃ¡rio."""
+    """Analisa um texto manualmente e salva como menção do usuário."""
     db = get_db()
     user_id = str(current_user.get("_id") or current_user.get("id"))
     text = payload.text.strip()
 
     if not text:
-        raise HTTPException(status_code=400, detail="Texto nÃ£o pode estar vazio")
+        raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
 
     search_id = f"manual-{user_id}"
-    query = payload.brand_name or "AnÃ¡lise Manual"
+    query = payload.brand_name or "Análise Manual"
     mention = normalize_mention(
         query=query,
         source=payload.source or "manual",
@@ -1107,7 +1107,7 @@ async def analyze(
         raw={"manual": True},
     )
     if not mention:
-        raise HTTPException(status_code=400, detail="Texto nÃ£o pode estar vazio")
+        raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
 
     enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
     try:
@@ -1151,7 +1151,7 @@ async def search_history(
     limit: int = Query(20, ge=1, le=100),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """HistÃ³rico de buscas do usuÃ¡rio."""
+    """Histórico de buscas do usuário."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     return {"history": SearchService.history(user_id, limit=limit)}
 
@@ -1182,7 +1182,7 @@ async def list_reports(
     offset: int = Query(0, ge=0),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Lista relatÃ³rios por empresa e perÃ­odo sem expor IDs internos."""
+    """Lista relatórios por empresa e período sem expor IDs internos."""
     user_id = str(current_user.get("_id") or current_user.get("id"))
     try:
         return ReportService.list_reports_filtered(
@@ -1316,7 +1316,7 @@ async def delete_search(id: str, current_user: dict[str, Any] = Depends(get_curr
     db = get_db()
     result = db.search_jobs.delete_one({"search_id": id, "user_id": user_id})
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Pesquisa nÃ£o encontrada")
+        raise HTTPException(status_code=404, detail="Pesquisa não encontrada")
     db.mentions.delete_many({"search_id": id, "user_id": user_id})
     return {"ok": True}
 
@@ -1371,7 +1371,7 @@ async def delete_all_user_data(
 
     return {
         "ok": True,
-        "message": "Todos os dados do usuÃ¡rio foram apagados com sucesso",
+        "message": "Todos os dados do usuário foram apagados com sucesso",
         "secondary_deleted": secondary_deleted,
     }
 

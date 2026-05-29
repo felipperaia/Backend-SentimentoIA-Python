@@ -47,11 +47,16 @@ from .report import (
 )
 
 from .ingestion import (
+    ALLOWED_INGESTION_SOURCES,
+    normalize_source_name,
     IngestionComment,
     IngestionBatchRequest,
     IngestionRejectedItem,
     IngestionBatchResponse,
     IngestionBatchSummary,
+    IngestionStagingListResponse,
+    IngestionCommitRequest,
+    IngestionCommitResponse,
 )
 
 from .chat import (
@@ -124,6 +129,11 @@ __all__ = [
     "IngestionRejectedItem",
     "IngestionBatchResponse",
     "IngestionBatchSummary",
+    "IngestionStagingListResponse",
+    "IngestionCommitRequest",
+    "IngestionCommitResponse",
+    "ALLOWED_INGESTION_SOURCES",
+    "normalize_source_name",
     # Chat schemas
     "ChatThreadCreateRequest",
     "ChatThreadResponse",
