@@ -1,6 +1,7 @@
 import csv
 import io
 from datetime import datetime, timedelta, timezone
+import os
 import re
 from typing import Any
 
@@ -9,6 +10,7 @@ from fastapi.responses import Response, StreamingResponse
 from app.database import get_db
 from app.services.company_utils import normalize_company_filter, slugify_company
 from app.services.dashboard_service import DashboardService
+from app.services.exporting import ExportContext, get_export_pipeline
 from app.services.search_service import SearchService
 
 
@@ -71,6 +73,37 @@ class ReportService:
                 "Exportacao PDF indisponivel no momento. Verifique a dependencia reportlab no backend."
             )
         return reportlab
+
+    @staticmethod
+    def _use_export_pipeline_v2() -> bool:
+        flag = str(os.getenv("EXPORT_PIPELINE_V2", "true") or "true").strip().lower()
+        return flag not in {"0", "false", "off", "no"}
+
+    @staticmethod
+    def _execute_export_pipeline(
+        *,
+        export_key: str,
+        user_id: str,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        period_from: datetime | None = None,
+        period_to: datetime | None = None,
+        period_days: int | None = None,
+        limit: int | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> StreamingResponse | Response:
+        context = ExportContext(
+            export_key=export_key,
+            user_id=user_id,
+            company_id=company_id,
+            company_slug=company_slug,
+            period_from=period_from,
+            period_to=period_to,
+            period_days=period_days,
+            limit=limit,
+            extra=extra or {},
+        )
+        return get_export_pipeline().execute(context)
 
     @staticmethod
     def _load_mentions(db, user_id: str, search_id: str) -> list[dict[str, Any]]:
@@ -1075,6 +1108,25 @@ class ReportService:
             period_to=period_to,
             period_days=period_days,
         )
+
+        if ReportService._use_export_pipeline_v2():
+            file_label = ReportService._report_file_label(
+                prefix="mentions",
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+            )
+            return ReportService._execute_export_pipeline(
+                export_key="mentions_csv_raw",
+                user_id=user_id,
+                company_id=company_id,
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+                limit=None,
+                extra={"filename": f"{file_label}.csv"},
+            )
+
         mentions = ReportService._load_mentions_by_scope(db=db, query=query)
         if not mentions:
             raise ValueError("Nenhuma mencao encontrada para o filtro informado")
@@ -1109,6 +1161,26 @@ class ReportService:
             period_to=period_to,
             period_days=period_days,
         )
+
+        if ReportService._use_export_pipeline_v2():
+            file_label = ReportService._report_file_label(
+                prefix="dashboard",
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+            )
+            response = ReportService._execute_export_pipeline(
+                export_key="dashboard_pdf",
+                user_id=user_id,
+                company_id=company_id,
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+                limit=None,
+                extra={"filename": f"{file_label}.pdf"},
+            )
+            return response
+
         mentions = ReportService._load_mentions_by_scope(db=db, query=query)
         if not mentions:
             raise ValueError("Nenhuma mencao encontrada para o filtro informado")
@@ -1149,6 +1221,24 @@ class ReportService:
             and effective_period_from > effective_period_to
         ):
             raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
+
+        if ReportService._use_export_pipeline_v2():
+            file_label = ReportService._report_file_label(
+                prefix="insights",
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+            )
+            return ReportService._execute_export_pipeline(
+                export_key="insights_pdf",
+                user_id=user_id,
+                company_id=company_id,
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+                limit=max(1, min(int(limit), 500)),
+                extra={"filename": f"{file_label}.pdf"},
+            )
 
         ReportService._require_reportlab_components()
 
@@ -1194,6 +1284,24 @@ class ReportService:
             and effective_period_from > effective_period_to
         ):
             raise ValueError("Faixa de datas invalida: from deve ser menor ou igual a to")
+
+        if ReportService._use_export_pipeline_v2():
+            file_label = ReportService._report_file_label(
+                prefix="metrics",
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+            )
+            return ReportService._execute_export_pipeline(
+                export_key="metrics_pdf",
+                user_id=user_id,
+                company_id=company_id,
+                company_slug=normalized_company_slug,
+                period_from=effective_period_from,
+                period_to=effective_period_to,
+                period_days=period_days,
+                extra={"filename": f"{file_label}.pdf"},
+            )
 
         metrics = DashboardService.aggregate_metrics(
             user_id=user_id,
