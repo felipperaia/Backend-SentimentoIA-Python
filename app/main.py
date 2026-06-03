@@ -243,7 +243,6 @@ def _score_company_slug_match(available_slug: str, candidate_slug: str) -> int:
 
 def _resolve_company_slug_for_search(
     *,
-    user_id: str,
     secondary_db,
     company_name: str,
     company_slug_override: str | None,
@@ -259,7 +258,7 @@ def _resolve_company_slug_for_search(
         return "", [], None
 
     staging_collection = secondary_db[IngestionService.STAGING_COLLECTION]
-    scoped_query: dict[str, Any] = {"user_id": user_id}
+    scoped_query: dict[str, Any] = {}
     if requested_sources:
         scoped_query["source"] = {"$in": requested_sources}
     if published_filter:
@@ -273,7 +272,7 @@ def _resolve_company_slug_for_search(
     if not available_slugs:
         available_slugs = [
             str(item or "").strip()
-            for item in staging_collection.distinct("company_slug", {"user_id": user_id})
+            for item in staging_collection.distinct("company_slug", {})
             if str(item or "").strip()
         ]
 
@@ -819,7 +818,6 @@ async def search_mentions(
         total_limit = None
 
     company_slug, company_slug_candidates, company_slug_received = _resolve_company_slug_for_search(
-        user_id=user_id,
         secondary_db=secondary_db,
         company_name=company_name,
         company_slug_override=payload.company_slug,
@@ -830,7 +828,6 @@ async def search_mentions(
         raise HTTPException(status_code=400, detail="company_slug invalido")
 
     staging_query: dict[str, Any] = {
-        "user_id": user_id,
         "company_slug": company_slug,
     }
     if requested_sources:
@@ -946,7 +943,6 @@ async def search_mentions(
     )
 
     filtros_aplicados = {
-        "user_id": user_id,
         "company_slug_recebido": company_slug_received,
         "company_slug_usado": company_slug,
         "company_slug_candidatos_testados": company_slug_candidates,
@@ -1772,9 +1768,9 @@ async def delete_all_user_data(
     secondary_deleted: dict[str, int] = {}
     try:
         secondary_db = get_secondary_db()
-        for coll in [IngestionService.STAGING_COLLECTION, IngestionService.BATCH_COLLECTION]:
-            result = secondary_db[coll].delete_many({"user_id": user_id})
-            secondary_deleted[coll] = int(result.deleted_count)
+        result = secondary_db[IngestionService.BATCH_COLLECTION].delete_many({"uploaded_by_user_id": user_id})
+        secondary_deleted[IngestionService.BATCH_COLLECTION] = int(result.deleted_count)
+        secondary_deleted[IngestionService.STAGING_COLLECTION] = 0
     except RuntimeError:
         secondary_deleted = {}
 

@@ -88,16 +88,17 @@ class MongoDB:
 
         try:
             staging_mentions = cls.secondary_db.ingestion_staging_mentions
-            staging_mentions.create_index([("user_id", 1), ("company_slug", 1), ("source", 1), ("published_at", -1)])
-            staging_mentions.create_index([("user_id", 1), ("batch_id", 1), ("published_at", -1)])
-            staging_mentions.create_index([("user_id", 1), ("company_slug", 1), ("published_at", -1)])
+            staging_mentions.create_index([("company_slug", 1), ("source", 1), ("published_at", -1)])
+            staging_mentions.create_index([("batch_id", 1), ("published_at", -1)])
+            staging_mentions.create_index([("company_slug", 1), ("published_at", -1)])
             # Em ambientes existentes, o indice antigo deve ser removido manualmente:
             # db.ingestion_staging_mentions.dropIndex("user_id_1_staging_hash_1")
             staging_mentions.create_index([("staging_hash", 1)], unique=True)
+            staging_mentions.create_index([("uploaded_by_user_id", 1), ("batch_id", 1)])
 
             staging_batches = cls.secondary_db.ingestion_staging_batches
             staging_batches.create_index("batch_id", unique=True)
-            staging_batches.create_index([("user_id", 1), ("created_at", -1)])
+            staging_batches.create_index([("uploaded_by_user_id", 1), ("created_at", -1)])
             logger.info("✓ Índices do MongoDB secundário criados com sucesso")
         except Exception as exc:
             logger.error("✗ Erro ao criar índices do MongoDB secundário: %s", exc)

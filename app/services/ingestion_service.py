@@ -110,7 +110,7 @@ class IngestionService:
             **payload_raw,
             "ingestion_input": raw_item,
             "ingestion_audit": {
-                "user_id": user_id,
+                "uploaded_by_user_id": user_id,
                 "batch_id": batch_id,
                 "company_name": company_name,
                 "company_slug": company_slug,
@@ -151,7 +151,7 @@ class IngestionService:
 
         normalized.update(
             {
-                "user_id": user_id,
+                "uploaded_by_user_id": user_id,
                 "batch_id": batch_id,
                 "company_name": company_name,
                 "company_slug": company_slug,
@@ -168,7 +168,6 @@ class IngestionService:
     @staticmethod
     def _build_staging_query(
         *,
-        user_id: str,
         batch_id: str | None = None,
         company_slug: str | None = None,
         source: str | None = None,
@@ -226,7 +225,6 @@ class IngestionService:
         safe_offset = max(0, int(offset))
 
         query, _ = IngestionService._build_staging_query(
-            user_id=user_id,
             batch_id=batch_id,
             company_slug=company_slug,
             source=source,
@@ -379,7 +377,6 @@ class IngestionService:
 
         safe_limit = max(1, min(int(limit), 20000))
         query, normalized_company_slug = IngestionService._build_staging_query(
-            user_id=user_id,
             batch_id=batch_id,
             company_slug=company_slug,
             source=source,
@@ -538,7 +535,7 @@ class IngestionService:
         batch_collection.insert_one(
             {
                 "batch_id": batch_id,
-                "user_id": user_id,
+                "uploaded_by_user_id": user_id,
                 "status": "completed",
                 "received_count": len(payload),
                 "inserted_count": inserted_count,
@@ -563,7 +560,7 @@ class IngestionService:
         secondary_db = get_secondary_db()
         batch_collection = secondary_db.get_collection(IngestionService.BATCH_COLLECTION)
         batches = list(
-            batch_collection.find({})
+            batch_collection.find({"uploaded_by_user_id": user_id})
             .sort("created_at", -1)
             .limit(limit)
         )
@@ -575,7 +572,7 @@ class IngestionService:
         batch_collection = secondary_db.get_collection(IngestionService.BATCH_COLLECTION)
         staging_collection = secondary_db.get_collection(IngestionService.STAGING_COLLECTION)
 
-        batch = batch_collection.find_one({"batch_id": batch_id})
+        batch = batch_collection.find_one({"batch_id": batch_id, "uploaded_by_user_id": user_id})
         if not batch:
             return None
 
