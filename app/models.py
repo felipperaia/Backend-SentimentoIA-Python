@@ -325,8 +325,10 @@ class MFAVerifyRequest(BaseModel):
 class SearchRequest(BaseModel):
     brand_name: Optional[str] = None
     query: Optional[str] = None
+    company_slug: Optional[str] = None
     sources: List[str] = Field(default_factory=list)
-    limit: int = Field(default=200, ge=1, le=2000)
+    limit: Optional[int] = Field(default=200, ge=1, le=2000)
+    per_source_limit: Optional[int] = Field(default=None, ge=1, le=2000)
     period_days: Optional[int] = Field(default=30, ge=1, le=3650)
     period_from: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("period_from", "from"))
     period_to: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("period_to", "to"))
@@ -338,6 +340,9 @@ class SearchRequest(BaseModel):
 
         if self.brand_name:
             self.brand_name = self.brand_name.strip()
+
+        if self.company_slug:
+            self.company_slug = self.company_slug.strip()
 
         if not self.brand_name:
             raise ValueError("brand_name ou query e obrigatorio")

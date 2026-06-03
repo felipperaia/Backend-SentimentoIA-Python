@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     urgency_patterns_medium: str = "insatisfeito|demora|atraso|decepcionado|esperava mais|ruim|poderia melhorar"
 
     # Rate limiting (requests per minute)
-    rate_limit_search_per_minute: int = 5
+    rate_limit_search_per_minute: int = 30
     rate_limit_analyze_per_minute: int = 10
 
     # NPS

@@ -31,7 +31,14 @@ from app.schemas import (
     UserSettingsUpdateRequest,
 )
 from app.services.chat_service import ChatService, ChatUnavailableError
-from app.services.company_utils import slugify_company
+from app.services.company_utils import (
+    COMPANY_ARTICLE_TOKENS,
+    COMPANY_CONNECTOR_TOKENS,
+    COMPANY_SUFFIX_TOKENS,
+    build_company_slug_candidates,
+    normalize_company_filter,
+    normalize_company_slug,
+)
 from app.services.dashboard_service import DashboardService
 from app.services.enrichment_service import EnrichmentService
 from app.services.ingestion_service import IngestionService
@@ -177,6 +184,170 @@ def _datetime_to_iso(value: datetime | None) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
     return None
+
+
+def _normalize_company_tokens(value: str) -> list[str]:
+    normalized = normalize_company_slug(value)
+    return [token for token in normalized.split("-") if token]
+
+
+def _core_company_tokens(tokens: list[str]) -> list[str]:
+    return [
+        token
+        for token in tokens
+        if token not in COMPANY_ARTICLE_TOKENS
+        and token not in COMPANY_CONNECTOR_TOKENS
+        and token not in COMPANY_SUFFIX_TOKENS
+    ]
+
+
+def _score_company_slug_match(available_slug: str, candidate_slug: str) -> int:
+    available_normalized = normalize_company_slug(available_slug)
+    candidate_normalized = normalize_company_slug(candidate_slug)
+    if not available_normalized or not candidate_normalized:
+        return 0
+
+    if available_normalized == candidate_normalized:
+        return 120
+
+    available_tokens = _normalize_company_tokens(available_normalized)
+    candidate_tokens = _normalize_company_tokens(candidate_normalized)
+    available_core = _core_company_tokens(available_tokens)
+    candidate_core = _core_company_tokens(candidate_tokens)
+
+    if available_core and available_core == candidate_core:
+        return 115
+    if available_tokens == candidate_core or candidate_tokens == available_core:
+        return 108
+    if candidate_tokens and available_tokens[: len(candidate_tokens)] == candidate_tokens:
+        return 104
+    if available_tokens and candidate_tokens[: len(available_tokens)] == available_tokens:
+        return 100
+    if candidate_core and available_core[: len(candidate_core)] == candidate_core:
+        return 96
+    if available_core and candidate_core[: len(available_core)] == available_core:
+        return 92
+
+    available_core_set = set(available_core)
+    candidate_core_set = set(candidate_core)
+    overlap = len(available_core_set & candidate_core_set)
+    if overlap <= 0 or not available_core_set or not candidate_core_set:
+        return 0
+
+    union_size = len(available_core_set | candidate_core_set) or 1
+    score = 60 + int((overlap / union_size) * 30)
+    if available_core[0] == candidate_core[0]:
+        score += 10
+    return score
+
+
+def _resolve_company_slug_for_search(
+    *,
+    user_id: str,
+    secondary_db,
+    company_name: str,
+    company_slug_override: str | None,
+    requested_sources: list[str],
+    published_filter: dict[str, Any],
+) -> tuple[str, list[str], str | None]:
+    received_slug = normalize_company_filter(company_slug=company_slug_override)
+    if received_slug:
+        return received_slug, [received_slug], received_slug
+
+    candidates = build_company_slug_candidates(company_name)
+    if not candidates:
+        return "", [], None
+
+    staging_collection = secondary_db[IngestionService.STAGING_COLLECTION]
+    scoped_query: dict[str, Any] = {"user_id": user_id}
+    if requested_sources:
+        scoped_query["source"] = {"$in": requested_sources}
+    if published_filter:
+        scoped_query["published_at"] = dict(published_filter)
+
+    available_slugs = [
+        str(item or "").strip()
+        for item in staging_collection.distinct("company_slug", scoped_query)
+        if str(item or "").strip()
+    ]
+    if not available_slugs:
+        available_slugs = [
+            str(item or "").strip()
+            for item in staging_collection.distinct("company_slug", {"user_id": user_id})
+            if str(item or "").strip()
+        ]
+
+    normalized_available = {
+        normalize_company_slug(item): item
+        for item in available_slugs
+        if normalize_company_slug(item)
+    }
+
+    for candidate in candidates:
+        matched = normalized_available.get(normalize_company_slug(candidate))
+        if matched:
+            return matched, candidates, None
+
+    best_slug = ""
+    best_score = -1
+    for available_slug in available_slugs:
+        slug_score = max(_score_company_slug_match(available_slug, candidate) for candidate in candidates)
+        if slug_score > best_score:
+            best_score = slug_score
+            best_slug = available_slug
+
+    if best_slug and best_score >= 70:
+        return best_slug, candidates, None
+
+    return candidates[0], candidates, None
+
+
+def _load_mentions_with_effective_limits(
+    *,
+    collection,
+    base_query: dict[str, Any],
+    requested_sources: list[str],
+    per_source_limit: int | None,
+    total_limit: int | None,
+    projection: dict[str, int] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if per_source_limit is None:
+        cursor = collection.find(base_query, projection).sort("published_at", -1)
+        if total_limit is not None:
+            cursor = cursor.limit(int(total_limit))
+        return list(cursor), requested_sources
+
+    effective_sources = list(requested_sources)
+    if not effective_sources:
+        effective_sources = sorted(
+            {
+                str(item or "").strip().lower()
+                for item in collection.distinct("source", base_query)
+                if str(item or "").strip()
+            }
+        )
+
+    items: list[dict[str, Any]] = []
+    for source in effective_sources:
+        source_query = dict(base_query)
+        source_query["source"] = source
+        cursor = collection.find(source_query, projection).sort("published_at", -1).limit(int(per_source_limit))
+        items.extend(list(cursor))
+
+    def sort_key(item: dict[str, Any]) -> float:
+        published_at = item.get("published_at")
+        if isinstance(published_at, datetime):
+            try:
+                return float(published_at.timestamp())
+            except (OverflowError, OSError, ValueError):
+                return 0.0
+        return 0.0
+
+    items.sort(key=sort_key, reverse=True)
+    if total_limit is not None:
+        items = items[: int(total_limit)]
+
+    return items, effective_sources
 
 
 def _log_report_export_event(
@@ -618,9 +789,6 @@ async def search_mentions(
 
     now = utcnow()
     company_name = str(payload.brand_name or "").strip()
-    company_slug = slugify_company(company_name)
-    if not company_slug:
-        raise HTTPException(status_code=400, detail="company_slug invalido")
 
     requested_sources = sorted(
         {
@@ -635,26 +803,50 @@ async def search_mentions(
     if effective_period_from is None and payload.period_days is not None:
         effective_period_from = now - timedelta(days=int(payload.period_days))
 
+    published_filter: dict[str, Any] = {}
+    if effective_period_from is not None:
+        published_filter["$gte"] = effective_period_from
+    if effective_period_to is not None:
+        published_filter["$lte"] = effective_period_to
+
+    limit_was_explicit = "limit" in payload.model_fields_set
+    per_source_limit = int(payload.per_source_limit) if payload.per_source_limit is not None else None
+    if per_source_limit is None:
+        total_limit = int(payload.limit or 200)
+    elif limit_was_explicit and payload.limit is not None:
+        total_limit = int(payload.limit)
+    else:
+        total_limit = None
+
+    company_slug, company_slug_candidates, company_slug_received = _resolve_company_slug_for_search(
+        user_id=user_id,
+        secondary_db=secondary_db,
+        company_name=company_name,
+        company_slug_override=payload.company_slug,
+        requested_sources=requested_sources,
+        published_filter=published_filter,
+    )
+    if not company_slug:
+        raise HTTPException(status_code=400, detail="company_slug invalido")
+
     staging_query: dict[str, Any] = {
         "user_id": user_id,
         "company_slug": company_slug,
     }
     if requested_sources:
         staging_query["source"] = {"$in": requested_sources}
-
-    published_filter: dict[str, Any] = {}
-    if effective_period_from is not None:
-        published_filter["$gte"] = effective_period_from
-    if effective_period_to is not None:
-        published_filter["$lte"] = effective_period_to
     if published_filter:
-        staging_query["published_at"] = published_filter
+        staging_query["published_at"] = dict(published_filter)
 
-    staging_mentions = list(
-        secondary_db[IngestionService.STAGING_COLLECTION]
-        .find(staging_query)
-        .sort("published_at", -1)
-        .limit(int(payload.limit))
+    staging_total_before_limits = int(
+        secondary_db[IngestionService.STAGING_COLLECTION].count_documents(staging_query)
+    )
+    staging_mentions, effective_sources = _load_mentions_with_effective_limits(
+        collection=secondary_db[IngestionService.STAGING_COLLECTION],
+        base_query=staging_query,
+        requested_sources=requested_sources,
+        per_source_limit=per_source_limit,
+        total_limit=total_limit,
     )
 
     search_id = f"search_{uuid4().hex}"
@@ -688,7 +880,7 @@ async def search_mentions(
             "query": company_name,
             "brand_name": company_name,
             "company_name": str(staged.get("company_name") or company_name),
-            "company_slug": company_slug,
+            "company_slug": str(staged.get("company_slug") or company_slug),
             "source": str(staged.get("source") or "unknown").strip().lower() or "unknown",
             "text": text[:5000],
             "author": str(staged.get("author") or "").strip() or "desconhecido",
@@ -729,35 +921,44 @@ async def search_mentions(
         primary_query["published_at"] = dict(published_filter)
 
     total_imported = len(imported_mentions)
-    total_available = int(db.mentions.count_documents(primary_query))
-    result_mentions = list(
-        db.mentions.find(primary_query, {"raw": 0, "raw_payload": 0}).sort("published_at", -1).limit(int(payload.limit))
+    total_available_primary = int(db.mentions.count_documents(primary_query))
+    result_mentions, effective_sources = _load_mentions_with_effective_limits(
+        collection=db.mentions,
+        base_query=primary_query,
+        requested_sources=requested_sources,
+        per_source_limit=per_source_limit,
+        total_limit=total_limit,
+        projection={"raw": 0, "raw_payload": 0},
     )
     metrics = EnrichmentService.aggregate(result_mentions) if result_mentions else EnrichmentService.aggregate([])
-    status = "completed" if total_available > 0 else "empty"
-    status_summary = {
-        "status": "success" if total_available > 0 else "empty",
-        "partial_success": False,
-        "message": (
+    status_summary = SearchService._build_status_summary(
+        requested_sources=effective_sources or requested_sources,
+        mentions=result_mentions,
+        errors=[],
+    )
+    status = "completed" if result_mentions else "empty"
+    status_summary["message"] = (
+        (
             f"Importacao concluida. {total_imported} mencao(oes) novas inseridas e {duplicate_count} duplicada(s) ignorada(s)."
-            if total_available > 0
+            if result_mentions
             else "Nenhuma mencao encontrada para os filtros informados."
-        ),
-        "sources_requested": len(requested_sources),
-        "sources_with_data": len({str(item.get('source') or '').strip().lower() for item in result_mentions if item.get('source')}),
-        "sources_failed": 0,
-        "timeout_sources": [],
-        "source_status": [],
-        "unmapped_error_count": 0,
-    }
+        )
+    )
 
     filtros_aplicados = {
         "user_id": user_id,
-        "company_slug": company_slug,
+        "company_slug_recebido": company_slug_received,
+        "company_slug_usado": company_slug,
+        "company_slug_candidatos_testados": company_slug_candidates,
         "sources": requested_sources,
+        "sources_efetivas": effective_sources,
         "period_from": effective_period_from.isoformat() if isinstance(effective_period_from, datetime) else None,
         "period_to": effective_period_to.isoformat() if isinstance(effective_period_to, datetime) else None,
-        "limit": int(payload.limit),
+        "limit": total_limit,
+        "per_source_limit": per_source_limit,
+        "total_encontrado_staging_antes_dos_limites": staging_total_before_limits,
+        "total_selecionado_staging_pos_limites": len(staging_mentions),
+        "total_disponivel_primario_sem_limite": total_available_primary,
     }
 
     db.search_jobs.update_one(
@@ -770,9 +971,9 @@ async def search_mentions(
                 "company_name": company_name,
                 "company_slug": company_slug,
                 "status": status,
-                "total": total_available,
+                "total": len(result_mentions),
                 "duplicate_count": duplicate_count,
-                "sources": requested_sources,
+                "sources": effective_sources or requested_sources,
                 "period_days": int(payload.period_days or 0),
                 "period_from": effective_period_from,
                 "period_to": effective_period_to,
@@ -795,7 +996,7 @@ async def search_mentions(
         "status": status_summary["status"],
         "partial_success": False,
         "status_summary": status_summary,
-        "total": total_available,
+        "total": len(result_mentions),
         "mentions": SearchService.serialize_many(result_mentions),
         "metrics": metrics,
         "llm_analysis": {},
