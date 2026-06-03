@@ -147,7 +147,7 @@ class IngestionService:
         if not dedupe_seed:
             dedupe_seed = hashlib.sha256(f"{source}|{validated.text}".encode("utf-8")).hexdigest()
 
-        staging_hash = hashlib.sha256(f"{user_id}|{company_slug}|{source}|{dedupe_seed}".encode("utf-8")).hexdigest()
+        staging_hash = hashlib.sha256(f"{company_slug}|{source}|{dedupe_seed}".encode("utf-8")).hexdigest()
 
         normalized.update(
             {
@@ -174,7 +174,7 @@ class IngestionService:
         source: str | None = None,
         staging_ids: list[str] | None = None,
     ) -> tuple[dict[str, Any], str | None]:
-        query: dict[str, Any] = {"user_id": user_id}
+        query: dict[str, Any] = {}
 
         normalized_batch_id = str(batch_id or "").strip()
         if normalized_batch_id:
@@ -518,7 +518,6 @@ class IngestionService:
         operations = [
             UpdateOne(
                 {
-                    "user_id": user_id,
                     "staging_hash": str(item.get("staging_hash") or ""),
                 },
                 {
@@ -564,7 +563,7 @@ class IngestionService:
         secondary_db = get_secondary_db()
         batch_collection = secondary_db.get_collection(IngestionService.BATCH_COLLECTION)
         batches = list(
-            batch_collection.find({"user_id": user_id})
+            batch_collection.find({})
             .sort("created_at", -1)
             .limit(limit)
         )
@@ -576,15 +575,13 @@ class IngestionService:
         batch_collection = secondary_db.get_collection(IngestionService.BATCH_COLLECTION)
         staging_collection = secondary_db.get_collection(IngestionService.STAGING_COLLECTION)
 
-        batch = batch_collection.find_one(
-            {"user_id": user_id, "batch_id": batch_id}
-        )
+        batch = batch_collection.find_one({"batch_id": batch_id})
         if not batch:
             return None
 
         recent_mentions = list(
             staging_collection.find(
-                {"user_id": user_id, "batch_id": batch_id},
+                {"batch_id": batch_id},
                 {"raw": 0},
             )
             .sort("published_at", -1)

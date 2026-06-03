@@ -91,7 +91,9 @@ class MongoDB:
             staging_mentions.create_index([("user_id", 1), ("company_slug", 1), ("source", 1), ("published_at", -1)])
             staging_mentions.create_index([("user_id", 1), ("batch_id", 1), ("published_at", -1)])
             staging_mentions.create_index([("user_id", 1), ("company_slug", 1), ("published_at", -1)])
-            staging_mentions.create_index([("user_id", 1), ("staging_hash", 1)], unique=True)
+            # Em ambientes existentes, o indice antigo deve ser removido manualmente:
+            # db.ingestion_staging_mentions.dropIndex("user_id_1_staging_hash_1")
+            staging_mentions.create_index([("staging_hash", 1)], unique=True)
 
             staging_batches = cls.secondary_db.ingestion_staging_batches
             staging_batches.create_index("batch_id", unique=True)
